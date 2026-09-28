@@ -1,0 +1,27 @@
+name: Release
+
+on:
+  push:
+    tags: ["*"]
+
+jobs:
+  release:
+    runs-on: codeberg-small
+    container:
+      image: node:24-bookworm
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v4
+      - name: Tag must equal manifest version (Obsidian resolves releases by it)
+        run: test "$(node -p 'require("./manifest.json").version')" = "$GITHUB_REF_NAME"
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - name: Stage release assets
+        run: mkdir -p dist/release && cp main.js manifest.json dist/release/
+      - name: Install jq for forgejo-release
+        run: apt-get update -qq && apt-get install -y -qq jq
+      - uses: https://code.forgejo.org/actions/forgejo-release@v2
+        with:
+          direction: upload
+          release-dir: dist/release
+          title: ${{ github.ref_name }}
