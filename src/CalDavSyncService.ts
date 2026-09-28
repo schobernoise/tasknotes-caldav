@@ -14,7 +14,7 @@
 import { Notice, TFile } from "obsidian";
 
 import type CalDavPlugin from "./main";
-import type { CalDavAccountSettings } from "./settings";
+import type { CalDavAccountSettings, CalDavTaskList } from "./settings";
 import {
 	MUTATION_SOURCE,
 	type TaskDependency,
@@ -35,7 +35,7 @@ import {
 	type LocalTaskSnapshot,
 	type RemoteTodoSnapshot,
 } from "./caldav/caldavReconciliation";
-import { taskBelongsToCollection, type CalDavCollectionScope } from "./caldav/collectionMembership";
+import { retagForList, routeTask, type AccountRouting, type TaskListRoute } from "./caldav/collectionMembership";
 import {
 	applyTaskToVTodo,
 	changedFields,
@@ -64,7 +64,6 @@ const CONTEXT = { source: MUTATION_SOURCE };
 /** A push that failed and is waiting to be retried. */
 interface PendingCalDavPush {
 	taskPath: string;
-	accountId: string;
 	requestedAt: number;
 	attempts: number;
 	lastAttemptAt?: number;
@@ -92,15 +91,28 @@ export function noticeFailures(failures: readonly SyncFailure[]): void {
 }
 
 interface CalDavResourceIndexEntry {
-	accountId: string;
 	uid: string;
 	path: string;
 	href: string;
 }
 
+/** A task list and the account whose login reaches it. */
+interface SyncTarget {
+	account: CalDavAccountSettings;
+	list: CalDavTaskList;
+}
+
+/** A list's first-sync plan, plus the linked tasks whose tags will move them into it. */
+export interface ListFirstSyncPreview {
+	list: CalDavTaskList;
+	plan: FirstSyncPlan;
+	moveIn: string[];
+}
+
 /** Sync bookkeeping persisted next to the settings in this plugin's data.json. */
 export interface SyncState {
 	fingerprints: Record<string, string>;
+	/** Keyed by list id. */
 	collectionState: Record<string, CalDavCollectionState>;
 	resourceIndex: CalDavResourceIndexEntry[];
 	syncQueue: PendingCalDavPush[];
@@ -123,7 +135,7 @@ export class CalDavSyncService {
 	private handlingPaths = new Set<string>();
 	/** Tasks whose relations pointed at a target with no UID yet. */
 	private pendingRelationPaths = new Set<string>();
-	private relationFlushTimers = new Map<string, number>();
+	private relationFlushTimer: number | null = null;
 	/** Set while replaying deferred relations, to keep the retry to one pass. */
 	private flushingRelations = false;
 	/** Imported tasks whose relations must wait until every sibling exists. */
@@ -171,18 +183,57 @@ export class CalDavSyncService {
 		for (const timer of this.pushTimers.values()) window.clearTimeout(timer);
 		if (this.retryTimer !== null) window.clearTimeout(this.retryTimer);
 		this.retryTimer = null;
-		for (const timer of this.relationFlushTimers.values()) window.clearTimeout(timer);
-		this.relationFlushTimers.clear();
+		if (this.relationFlushTimer !== null) window.clearTimeout(this.relationFlushTimer);
+		this.relationFlushTimer = null;
 		this.pollTimers.clear();
 		this.pushTimers.clear();
 	}
 
 	private enabledAccounts(): CalDavAccountSettings[] {
-		return this.settings.accounts.filter((account) => account.enabled && account.collectionUrl);
+		return this.settings.accounts.filter((account) => account.enabled && account.lists.length > 0);
 	}
 
 	private getAccount(accountId: string): CalDavAccountSettings | undefined {
 		return this.settings.accounts.find((account) => account.id === accountId);
+	}
+
+	private findTarget(listId: string | undefined): SyncTarget | undefined {
+		for (const account of this.settings.accounts) {
+			const list = account.lists.find((candidate) => candidate.id === listId);
+			if (list) return { account, list };
+		}
+		return undefined;
+	}
+
+	/**
+	 * Where a task should sync to now: its own account is asked first, so a
+	 * linked task stays put while its list still claims it.
+	 *
+	 * A list still waiting for its first sync takes unlinked tasks (they upload
+	 * during that first sync) but does not pull linked ones away from a working
+	 * list until then; `activating` names the list whose first sync is running.
+	 */
+	private routeTarget(task: TaskInfo, activating?: string): SyncTarget | undefined {
+		const linkedId = this.listIdAt(task.path);
+		const current = this.findTarget(linkedId);
+		if (current && !current.account.enabled && current.list.id !== activating) return undefined;
+
+		const others = this.settings.accounts.filter(
+			(account) =>
+				account !== current?.account &&
+				account.lists.length > 0 &&
+				(account.enabled || account.lists.some((list) => list.id === activating))
+		);
+		const accounts = current ? [current.account, ...others] : others;
+
+		for (const account of accounts) {
+			const listId = routeTask(task, routingFor(account), account === current?.account ? linkedId : undefined);
+			const list = account.lists.find((candidate) => candidate.id === listId);
+			if (!list) continue;
+			if (current && !list.initialSyncCompleted && list.id !== activating) return current;
+			return { account, list };
+		}
+		return current;
 	}
 
 	// -----------------------------------------------------------------------
@@ -204,15 +255,14 @@ export class CalDavSyncService {
 		const fingerprint = getCalDavRelevantFingerprint(task);
 		if (this.state.fingerprints[path] === fingerprint) return; // nothing sync-relevant changed
 
-		const account = this.resolveAccountForTask(task);
-		if (!account || !this.settings.pushOnChange) {
+		if (!this.routeTarget(task) || !this.settings.pushOnChange) {
 			// Out of scope, or waiting for the poll: remember the fingerprint so
 			// we do not re-evaluate it on every keystroke.
 			await this.recordFingerprint(path, fingerprint);
 			return;
 		}
 
-		this.schedulePush(account, path);
+		this.schedulePush(path);
 	}
 
 	/** Deletes the remote VTODO when its task file is removed from the vault. */
@@ -222,16 +272,13 @@ export class CalDavSyncService {
 	): Promise<void> {
 		if (this.destroyed) return;
 
-		const accountId = asString(previousFrontmatter?.[CALDAV_FRONTMATTER_KEYS.account]);
+		const target = this.findTarget(asString(previousFrontmatter?.[CALDAV_FRONTMATTER_KEYS.account]));
 		const href = asString(previousFrontmatter?.[CALDAV_FRONTMATTER_KEYS.href]);
 		const etag = asString(previousFrontmatter?.[CALDAV_FRONTMATTER_KEYS.etag]);
-		if (!accountId || !href) return;
-
-		const account = this.getAccount(accountId);
-		if (!account?.enabled) return;
+		if (!target?.account.enabled || !href) return;
 
 		try {
-			const client = this.createClient(account);
+			const client = this.createClient(target.account);
 			await client.deleteResource(href, etag ? { ifMatch: etag } : {});
 			await this.forgetTask(path);
 		} catch (error) {
@@ -239,17 +286,17 @@ export class CalDavSyncService {
 		}
 	}
 
-	private schedulePush(account: CalDavAccountSettings, path: string): void {
+	private schedulePush(path: string): void {
 		const existing = this.pushTimers.get(path);
 		if (existing !== undefined) window.clearTimeout(existing);
 
 		const timer = window.setTimeout(() => {
 			this.pushTimers.delete(path);
-			void this.pushIfStillChanged(account.id, path).catch((error: unknown) => {
+			void this.pushIfStillChanged(path).catch((error: unknown) => {
 				this.logError("Failed to push task", error, { operation: "push" });
 				// Without this the edit is simply lost until the task is touched
 				// again: a transient network failure would silently desync a task.
-				void this.enqueueRetry(account.id, path, error);
+				void this.enqueueRetry(path, error);
 			});
 		}, this.settings.pushDebounceMs);
 		this.pushTimers.set(path, timer);
@@ -265,58 +312,122 @@ export class CalDavSyncService {
 	 * TaskNotes rename, for one, announces the new path mid-update — and
 	 * pushing then would bounce the pulled content straight back.
 	 */
-	private async pushIfStillChanged(accountId: string, path: string): Promise<void> {
+	private async pushIfStillChanged(path: string): Promise<void> {
 		const task = await this.api.tasks.get(path);
 		if (task && this.state.fingerprints[path] === getCalDavRelevantFingerprint(task)) return;
-		await this.pushTask(accountId, path);
+		await this.pushTask(path);
 	}
 
-	async pushTask(accountId: string, path: string): Promise<void> {
-		const account = this.getAccount(accountId);
-		if (!account?.enabled || this.destroyed) return;
-
+	/** Pushes a task to the list its tags route it to, moving it there if it lives elsewhere. */
+	async pushTask(path: string): Promise<void> {
+		if (this.destroyed) return;
 		const task = await this.api.tasks.get(path);
-		const file = this.getFile(path);
-		if (!task || !file) return;
+		const target = task ? this.routeTarget(task) : undefined;
+		// A list waiting for its first sync uploads its tasks during that sync.
+		if (!task || !target?.list.initialSyncCompleted) return;
+		await this.putTask(target, task);
+	}
 
-		const client = this.createClient(account);
+	private async putTask(target: SyncTarget, task: TaskInfo): Promise<void> {
+		const { path } = task;
+		const file = this.getFile(path);
+		if (!file) return;
+
 		const snapshot = this.snapshotTask(task, file);
 		const uid = snapshot.uid ?? generateUid();
-		const href = snapshot.href ?? joinUrl(account.collectionUrl, `${uid}.ics`);
+		const linked = this.findTarget(this.listIdAt(path));
+		let existingData: string | undefined;
+		let etag = snapshot.etag;
+		let href = snapshot.href;
 
-		// Fetch the current resource first so properties we do not model —
-		// VALARM, X- properties, DESCRIPTION written on a phone — survive.
-		const existing = snapshot.href ? await client.getResource(href) : null;
-		const doc =
-			(existing?.data ? parseVTodoDocument(existing.data) : null) ?? createVTodoDocument();
+		if (href && linked && linked.list.id !== target.list.id) {
+			const moved = await this.detachForMove(linked, target, task, href, snapshot.etag);
+			if (moved === null) return;
+			existingData = moved;
+			href = etag = undefined;
+		} else if (href && !linked) {
+			// Linked to a list that no longer exists here: upload afresh.
+			href = etag = undefined;
+		} else if (href) {
+			// Fetch the current resource first so properties we do not model —
+			// VALARM, X- properties, DESCRIPTION written on a phone — survive.
+			existingData = (await this.createClient(target.account).getResource(href))?.data;
+		}
+		href ??= joinUrl(target.list.url, `${uid}.ics`);
 
-		applyTaskToVTodo(doc, task, this.mappingContext(account), { uid });
+		const doc = (existingData ? parseVTodoDocument(existingData) : null) ?? createVTodoDocument();
+		applyTaskToVTodo(doc, task, this.mappingContext(target), { uid });
 		const relations = await this.resolveOutboundRelations(task);
 		applyRelations(doc, relations.relations);
 		applyReminders(doc, task.reminders ?? []);
 		const body = serializeVTodoDocument(doc);
 
-		const result = await client.putResource(
+		const result = await this.createClient(target.account).putResource(
 			href,
 			body,
-			snapshot.etag ? { ifMatch: snapshot.etag } : { ifNoneMatch: "*" }
+			etag ? { ifMatch: etag } : { ifNoneMatch: "*" }
 		);
 
 		if (result.conflict) {
-			await this.resolveConflictAt(account, path, href, task);
+			await this.resolveConflictAt(target, path, href, task);
 			return;
 		}
 
-		await this.stampSyncMetadata(path, { uid, href, etag: result.etag, accountId: account.id });
-		await this.indexResource({ accountId: account.id, uid, path, href });
+		await this.stampSyncMetadata(path, { uid, href, etag: result.etag, listId: target.list.id });
+		await this.indexResource({ uid, path, href });
 
 		// A parent pushed moments earlier only gets its UID once its own write
 		// lands, so revisit the link rather than leaving the hierarchy missing
 		// on the server until the next poll.
 		if (relations.unresolved && !this.flushingRelations) {
 			this.pendingRelationPaths.add(path);
-			this.scheduleRelationFlush(account.id);
+			this.scheduleRelationFlush();
 		}
+	}
+
+	/**
+	 * First half of moving a task to another list: removes it from the old one
+	 * and relinks the note to the new one without an href, so a failed upload
+	 * afterwards is retried as a plain upload rather than lost.
+	 *
+	 * Resolves with the old body, so what the plugin does not model carries
+	 * over, or null when the move cannot happen now (the old copy changed or
+	 * vanished, which the usual conflict or deletion handling takes over).
+	 */
+	private async detachForMove(
+		from: SyncTarget,
+		to: SyncTarget,
+		task: TaskInfo,
+		href: string,
+		etag: string | undefined
+	): Promise<string | null> {
+		const client = this.createClient(from.account);
+		const current = await client.getResource(href);
+		if (!current?.data) {
+			await this.applyRemoteDeletion(from, task.path);
+			return null;
+		}
+		const removed = await client.deleteResource(href, etag ? { ifMatch: etag } : {});
+		if (removed.conflict) {
+			await this.resolveConflictAt(from, task.path, href, task);
+			return null;
+		}
+
+		this.handlingPaths.add(task.path);
+		try {
+			await this.plugin.app.fileManager.processFrontMatter(this.requireFile(task.path), (frontmatter) => {
+				frontmatter[CALDAV_FRONTMATTER_KEYS.account] = to.list.id;
+				delete frontmatter[CALDAV_FRONTMATTER_KEYS.href];
+				delete frontmatter[CALDAV_FRONTMATTER_KEYS.etag];
+			});
+		} finally {
+			this.handlingPaths.delete(task.path);
+		}
+		this.logger.info("Moving task to another list", {
+			operation: "move",
+			details: { path: task.path, from: from.list.id, to: to.list.id },
+		});
+		return current.data;
 	}
 
 	/**
@@ -324,17 +435,17 @@ export class CalDavSyncService {
 	 * sides changed; this only decides who wins and applies it.
 	 */
 	private async resolveConflictAt(
-		account: CalDavAccountSettings,
+		target: SyncTarget,
 		path: string,
 		href: string,
 		task: TaskInfo
 	): Promise<void> {
-		const client = this.createClient(account);
+		const client = this.createClient(target.account);
 		const current = await client.getResource(href);
 
 		if (!current?.data) {
 			// Vanished between the PUT and the GET: treat as a remote deletion.
-			await this.applyRemoteDeletion(account, path);
+			await this.applyRemoteDeletion(target, path);
 			return;
 		}
 
@@ -359,7 +470,7 @@ export class CalDavSyncService {
 		});
 
 		if (winner === "local") {
-			applyTaskToVTodo(remoteDoc, task, this.mappingContext(account), {
+			applyTaskToVTodo(remoteDoc, task, this.mappingContext(target), {
 				uid: readVTodoUid(remoteDoc) ?? generateUid(),
 			});
 			const retry = await client.putResource(href, serializeVTodoDocument(remoteDoc), {
@@ -370,13 +481,13 @@ export class CalDavSyncService {
 					uid: readVTodoUid(remoteDoc) ?? "",
 					href,
 					etag: retry.etag,
-					accountId: account.id,
+					listId: target.list.id,
 				});
 			}
 			return;
 		}
 
-		await this.applyRemotePatch(account, path, {
+		await this.applyRemotePatch(target, path, {
 			uid: readVTodoUid(remoteDoc) ?? "",
 			url: href,
 			etag: current.etag,
@@ -390,8 +501,13 @@ export class CalDavSyncService {
 	// -----------------------------------------------------------------------
 
 	/**
-	 * One polling pass for a single account. Resolves with what failed, already
-	 * logged; a task that fails is skipped so it cannot block the rest.
+	 * One polling pass over every list of an account. Resolves with what
+	 * failed, already logged; a task that fails is skipped so it cannot block
+	 * the rest.
+	 *
+	 * All lists are read together because a task moved between lists on a
+	 * phone vanishes from one and appears in another: seen one list at a time,
+	 * that is a deletion plus a new task.
 	 */
 	async syncAccount(accountId: string, options: { force?: boolean } = {}): Promise<SyncFailure[]> {
 		const force = options.force ?? false;
@@ -403,62 +519,49 @@ export class CalDavSyncService {
 		this.inFlightAccounts.add(accountId);
 		try {
 			const client = this.createClient(account);
-			const state = this.state.collectionState[accountId] ?? {};
+			const active = account.lists.filter((list) => list.initialSyncCompleted);
 
 			// Collections routinely mix VTODOs with far more VEVENTs, so ask for
-			// the change token first and skip everything else when it has not
-			// moved. Walking the resource list instead would drag down every
-			// event body just to discover none of them are tasks.
-			const tag = await client.getCollectionTag(account.collectionUrl);
-			const currentTag = tag.ctag ?? tag.syncToken;
-			if (currentTag && state.ctag === currentTag && !force) return [];
+			// the change tokens first and skip everything else when none moved.
+			// Walking the resource lists instead would drag down every event body
+			// just to discover none of them are tasks.
+			const tags = new Map<string, { ctag?: string; syncToken?: string }>();
+			for (const list of active) tags.set(list.id, await client.getCollectionTag(list.url));
+			const unchanged = active.every((list) => {
+				const tag = tags.get(list.id);
+				const currentTag = tag?.ctag ?? tag?.syncToken;
+				return currentTag !== undefined && this.state.collectionState[list.id]?.ctag === currentTag;
+			});
+			if (unchanged && !force) return [];
 
 			// A VTODO-filtered calendar-query returns only tasks, and returns all
 			// of them — completeness is what makes deletion detection safe.
-			const remotes = await this.fetchRemoteSnapshots(client, account);
-			const locals = await this.snapshotAccountTasks(account);
-			const plan = planIncrementalSync(locals, remotes, { remotesAreComplete: true });
+			const remotesByList = new Map<string, RemoteSnapshotWithData[]>();
+			for (const list of account.lists) {
+				remotesByList.set(list.id, await this.fetchRemoteSnapshots(client, list));
+			}
+			const moved = await this.adoptRemoteMoves(account, remotesByList, failures);
 
-			for (const remote of plan.toPull) {
-				const withData = remotes.find((entry) => entry.uid === remote.uid);
-				if (withData) {
-					await this.isolate(failures, `server task ${remote.uid}`, () =>
-						this.applyRemotePatch(account, undefined, withData)
-					);
+			for (const list of active) {
+				const listFailures = await this.syncList(
+					{ account, list },
+					(remotesByList.get(list.id) ?? []).filter((remote) => !moved.uids.has(remote.uid)),
+					moved.paths
+				);
+				failures.push(...listFailures);
+
+				// Only a clean run moves the bookmark; otherwise the next poll would
+				// see an unchanged list and never retry what failed.
+				if (listFailures.length === 0) {
+					const tag = tags.get(list.id);
+					this.state.collectionState[list.id] = {
+						syncToken: tag?.syncToken ?? this.state.collectionState[list.id]?.syncToken,
+						ctag: tag?.ctag ?? tag?.syncToken,
+						lastSyncedAt: new Date().toISOString(),
+					};
 				}
 			}
-
-			for (const conflict of plan.conflicts) {
-				await this.isolate(failures, conflict.local.path, async () => {
-					if (conflict.winner === "local") {
-						await this.pushTask(accountId, conflict.local.path);
-						return;
-					}
-					const withData = remotes.find((entry) => entry.uid === conflict.remote.uid);
-					if (withData) await this.applyRemotePatch(account, conflict.local.path, withData);
-				});
-			}
-
-			for (const local of plan.remoteDeleted) {
-				await this.isolate(failures, local.path, () => this.applyRemoteDeletion(account, local.path));
-			}
-
-			for (const local of plan.toPush) {
-				await this.isolate(failures, local.path, () => this.pushTask(accountId, local.path));
-			}
-
-			await this.flushRelations(account);
-
-			// Only a clean run moves the bookmark; otherwise the next poll would see
-			// an unchanged collection and never retry what failed.
-			if (failures.length === 0) {
-				this.state.collectionState[accountId] = {
-					syncToken: tag.syncToken ?? state.syncToken,
-					ctag: currentTag,
-					lastSyncedAt: new Date().toISOString(),
-				};
-				await this.plugin.saveState();
-			}
+			await this.plugin.saveState();
 			return failures;
 		} catch (error) {
 			this.reportSyncError(account, error);
@@ -469,22 +572,115 @@ export class CalDavSyncService {
 	}
 
 	/**
+	 * Relinks tasks whose VTODO now sits in a different list of the account, as
+	 * after a move on a phone, and swaps their routing tags to match.
+	 *
+	 * Resolves with what it handled, so the per-list passes skip it: Obsidian's
+	 * metadata cache still shows the old link until it catches up with the
+	 * write, and the old list would read that as a deletion.
+	 */
+	private async adoptRemoteMoves(
+		account: CalDavAccountSettings,
+		remotesByList: ReadonlyMap<string, readonly RemoteSnapshotWithData[]>,
+		failures: SyncFailure[]
+	): Promise<{ paths: Set<string>; uids: Set<string> }> {
+		const moved = { paths: new Set<string>(), uids: new Set<string>() };
+		const listOfUid = new Map<string, { list: CalDavTaskList; remote: RemoteSnapshotWithData }>();
+		for (const list of account.lists) {
+			for (const remote of remotesByList.get(list.id) ?? []) listOfUid.set(remote.uid, { list, remote });
+		}
+
+		for (const task of await this.api.tasks.list()) {
+			const from = account.lists.find((list) => list.id === this.listIdAt(task.path));
+			const uid = this.uidForPath(task.path);
+			const found = uid ? listOfUid.get(uid) : undefined;
+			if (!from || !uid || !found || found.list === from) continue;
+			if ((remotesByList.get(from.id) ?? []).some((remote) => remote.uid === uid)) continue;
+
+			await this.isolate(failures, task.path, () =>
+				this.applyRemotePatch({ account, list: found.list }, task.path, found.remote, from)
+			);
+			moved.paths.add(task.path);
+			moved.uids.add(uid);
+		}
+		return moved;
+	}
+
+	/** One list's share of a poll: pull, resolve, delete and push as planned. */
+	private async syncList(
+		target: SyncTarget,
+		remotes: readonly RemoteSnapshotWithData[],
+		skipPaths: ReadonlySet<string>
+	): Promise<SyncFailure[]> {
+		const failures: SyncFailure[] = [];
+		const locals = (await this.snapshotListTasks(target)).filter((local) => !skipPaths.has(local.path));
+		const plan = planIncrementalSync(locals, remotes, { remotesAreComplete: true });
+
+		// Linked here but now routed elsewhere, e.g. after its list's tags were
+		// edited in settings: pushing moves it.
+		const planned = new Set(
+			[...plan.toPush, ...plan.remoteDeleted, ...plan.conflicts.map((conflict) => conflict.local)].map(
+				(local) => local.path
+			)
+		);
+		for (const local of locals) {
+			if (!local.uid || planned.has(local.path)) continue;
+			const task = await this.api.tasks.get(local.path);
+			const routed = task ? this.routeTarget(task) : undefined;
+			if (routed && routed.list.id !== target.list.id) plan.toPush.push(local);
+		}
+
+		for (const remote of plan.toPull) {
+			const withData = remotes.find((entry) => entry.uid === remote.uid);
+			if (withData) {
+				await this.isolate(failures, `server task ${remote.uid}`, () =>
+					this.applyRemotePatch(target, undefined, withData)
+				);
+			}
+		}
+
+		for (const conflict of plan.conflicts) {
+			await this.isolate(failures, conflict.local.path, async () => {
+				if (conflict.winner === "local") {
+					await this.pushTask(conflict.local.path);
+					return;
+				}
+				const withData = remotes.find((entry) => entry.uid === conflict.remote.uid);
+				if (withData) await this.applyRemotePatch(target, conflict.local.path, withData);
+			});
+		}
+
+		for (const local of plan.remoteDeleted) {
+			await this.isolate(failures, local.path, () => this.applyRemoteDeletion(target, local.path));
+		}
+
+		for (const local of plan.toPush) {
+			await this.isolate(failures, local.path, () => this.pushTask(local.path));
+		}
+
+		await this.flushRelations();
+		return failures;
+	}
+
+	/**
 	 * Writes a remote VTODO into the vault, either patching the matching task or
 	 * creating one. `knownPath` short-circuits the index lookup when the caller
-	 * already knows which task this is.
+	 * already knows which task this is; `movedFrom` is the list the task was in
+	 * before it was moved on the server, whose routing tags it sheds.
 	 */
 	private async applyRemotePatch(
-		account: CalDavAccountSettings,
+		target: SyncTarget,
 		knownPath: string | undefined,
-		remote: RemoteSnapshotWithData
+		remote: RemoteSnapshotWithData,
+		movedFrom?: CalDavTaskList
 	): Promise<void> {
 		const doc = parseVTodoDocument(remote.data);
 		if (!doc) return;
 
 		const uid = readVTodoUid(doc) ?? remote.uid;
-		const context = this.mappingContext(account);
+		const context = this.mappingContext(target);
 		const patch = readVTodoIntoTaskPatch(doc, context);
-		const path = knownPath ?? (await this.findPathForUid(account.id, uid));
+		const path = knownPath ?? (await this.findPathForUid(uid));
 
 		if (path) {
 			const local = await this.api.tasks.get(path);
@@ -494,8 +690,11 @@ export class CalDavSyncService {
 			const updates = toTaskUpdate(
 				changedFields(patch, readVTodoIntoTaskPatch(ownEncoding, context)),
 				local,
-				this.taskTags()
+				this.protectedTags(target.list)
 			);
+			if (movedFrom) {
+				updates.tags = retagForList(updates.tags ?? local.tags ?? [], routeOf(movedFrom), routeOf(target.list));
+			}
 			// A title change renames the note when TaskNotes stores titles in
 			// filenames, so everything after the update follows the returned path.
 			let currentPath = path;
@@ -511,21 +710,25 @@ export class CalDavSyncService {
 					uid,
 					href: remote.url,
 					etag: remote.etag,
-					accountId: account.id,
+					listId: target.list.id,
 				});
 				if (currentPath !== path) await this.forgetTask(path);
 			} finally {
 				this.handlingPaths.delete(path);
 				this.handlingPaths.delete(currentPath);
 			}
-			await this.indexResource({ accountId: account.id, uid, path: currentPath, href: remote.url });
-			await this.applyInboundRelations(account, currentPath, doc);
+			await this.indexResource({ uid, path: currentPath, href: remote.url });
+			await this.applyInboundRelations(currentPath, doc);
 			return;
 		}
 
 		// New on the server: create through TaskNotes so folder rules, templates
-		// and defaults all apply.
-		const tags = mergeRemoteTags(patch.tags ?? [], this.taskTags(), this.taskTags());
+		// and defaults all apply. It takes its list's tag, so routing keeps it there.
+		const tags = retagForList(
+			mergeRemoteTags(patch.tags ?? [], this.taskTags(), this.taskTags()),
+			undefined,
+			routeOf(target.list)
+		);
 		const created = await this.api.tasks.create(
 			{
 				title: patch.title ?? "Untitled task",
@@ -548,7 +751,7 @@ export class CalDavSyncService {
 					[CALDAV_FRONTMATTER_KEYS.uid]: uid,
 					[CALDAV_FRONTMATTER_KEYS.href]: remote.url,
 					...(remote.etag ? { [CALDAV_FRONTMATTER_KEYS.etag]: remote.etag } : {}),
-					[CALDAV_FRONTMATTER_KEYS.account]: account.id,
+					[CALDAV_FRONTMATTER_KEYS.account]: target.list.id,
 					[CALDAV_FRONTMATTER_KEYS.syncedAt]: new Date().toISOString(),
 				},
 			},
@@ -561,7 +764,7 @@ export class CalDavSyncService {
 		const stored = await this.api.tasks.get(created.path);
 		if (!stored) throw new Error(`TaskNotes did not return the imported task at ${created.path}`);
 		await this.recordFingerprint(created.path, getCalDavRelevantFingerprint(stored));
-		await this.indexResource({ accountId: account.id, uid, path: created.path, href: remote.url });
+		await this.indexResource({ uid, path: created.path, href: remote.url });
 		// Deferred: a parent imported later in this same run has no path yet.
 		this.pendingInboundRelations.push({ path: created.path, doc });
 	}
@@ -617,15 +820,7 @@ export class CalDavSyncService {
 		for (const path of paths) {
 			if (!this.getFile(path)) continue; // stale index entry
 			try {
-				await this.clearSyncMetadata(path);
-
-				// Keep the fingerprint rather than forgetting it. Dropping it would
-				// make the task look freshly edited, and push-on-change would
-				// immediately re-upload it under a new UID — unlinking would undo
-				// itself and leave a duplicate behind.
-				const task = await this.api.tasks.get(path);
-				if (task) await this.recordFingerprint(path, getCalDavRelevantFingerprint(task));
-
+				await this.unlinkTask(path);
 				unlinked++;
 			} catch (error) {
 				this.logError("Failed to unlink a task from CalDAV", error, {
@@ -642,20 +837,64 @@ export class CalDavSyncService {
 		return unlinked;
 	}
 
+	/** Removes a task's CalDAV link, leaving the note and the server copy alone. */
+	private async unlinkTask(path: string): Promise<void> {
+		await this.clearSyncMetadata(path);
+
+		// Keep the fingerprint rather than forgetting it. Dropping it would make
+		// the task look freshly edited, and push-on-change would immediately
+		// re-upload it under a new UID — unlinking would undo itself and leave a
+		// duplicate behind.
+		const task = await this.api.tasks.get(path);
+		if (task) await this.recordFingerprint(path, getCalDavRelevantFingerprint(task));
+	}
+
+	/**
+	 * Takes a list out of an account's routing. Its tasks move to wherever
+	 * their tags now route them; a task with nowhere to go is unlinked and its
+	 * copy stays on the server. The list is only dropped from the settings when
+	 * every task left it, so a failed move can be retried.
+	 */
+	async removeList(accountId: string, listId: string): Promise<SyncFailure[]> {
+		const account = this.getAccount(accountId);
+		const list = account?.lists.find((candidate) => candidate.id === listId);
+		if (!account || !list) return [];
+		const remaining = account.lists.filter((candidate) => candidate !== list);
+		const routing = routingFor({
+			...account,
+			lists: remaining,
+			defaultListId: account.defaultListId === listId ? "" : account.defaultListId,
+		});
+		const failures: SyncFailure[] = [];
+
+		for (const task of await this.api.tasks.list()) {
+			if (this.listIdAt(task.path) !== listId) continue;
+			const destination = remaining.find((candidate) => candidate.id === routeTask(task, routing, listId));
+			await this.isolate(failures, task.path, () =>
+				destination ? this.putTask({ account, list: destination }, task) : this.unlinkTask(task.path)
+			);
+		}
+
+		if (failures.length === 0) {
+			account.lists = remaining;
+			if (account.defaultListId === listId) account.defaultListId = "";
+			delete this.state.collectionState[listId];
+			await this.plugin.saveSettings();
+		}
+		return failures;
+	}
+
 	// -----------------------------------------------------------------------
 	// Retry queue
 	// -----------------------------------------------------------------------
 
-	private async enqueueRetry(accountId: string, path: string, error: unknown): Promise<void> {
-		const existing = this.state.syncQueue.find(
-			(entry) => entry.taskPath === path && entry.accountId === accountId
-		);
+	private async enqueueRetry(path: string, error: unknown): Promise<void> {
+		const existing = this.state.syncQueue.find((entry) => entry.taskPath === path);
 		if (existing) {
 			existing.lastError = describeError(error);
 		} else {
 			this.state.syncQueue.push({
 				taskPath: path,
-				accountId,
 				requestedAt: Date.now(),
 				attempts: 0,
 				lastError: describeError(error),
@@ -681,8 +920,8 @@ export class CalDavSyncService {
 
 		const remaining: PendingCalDavPush[] = [];
 		for (const entry of queue) {
-			const account = this.getAccount(entry.accountId);
-			if (!account?.enabled) {
+			const linked = this.findTarget(this.listIdAt(entry.taskPath));
+			if (linked && !linked.account.enabled) {
 				// Hold rather than drop: the account may simply be switched off
 				// for now, and the edit is still worth sending when it returns.
 				remaining.push(entry);
@@ -690,7 +929,7 @@ export class CalDavSyncService {
 			}
 
 			try {
-				await this.pushTask(entry.accountId, entry.taskPath);
+				await this.pushTask(entry.taskPath);
 			} catch (error) {
 				const attempts = entry.attempts + 1;
 				if (attempts >= MAX_PUSH_ATTEMPTS) {
@@ -713,10 +952,7 @@ export class CalDavSyncService {
 		// Anything enqueued while this drain was awaiting pushes is not in
 		// `queue`, so keep it rather than overwriting with the starting snapshot.
 		const enqueuedDuringDrain = this.state.syncQueue.filter(
-			(entry) =>
-				!queue.some(
-					(seen) => seen.taskPath === entry.taskPath && seen.accountId === entry.accountId
-				)
+			(entry) => !queue.some((seen) => seen.taskPath === entry.taskPath)
 		);
 		this.state.syncQueue = [...remaining, ...enqueuedDuringDrain];
 		await this.plugin.saveState();
@@ -755,8 +991,8 @@ export class CalDavSyncService {
 		}
 
 		if (unresolved) {
-			// Expected whenever a parent is archived or filtered into another
-			// account — not a failure, so not a warning.
+			// Expected whenever a parent is archived or not synced at all —
+			// not a failure, so not a warning.
 			this.logger.debug("Some relations have no CalDAV counterpart yet", {
 				operation: "caldav-resolve-relations",
 				details: { path: task.path },
@@ -773,24 +1009,20 @@ export class CalDavSyncService {
 	 * an alarm list a foreign client stripped, must not erase what the vault
 	 * already holds. Only resolved values are written.
 	 */
-	private async applyInboundRelations(
-		account: CalDavAccountSettings,
-		path: string,
-		doc: VTodoDocument
-	): Promise<void> {
+	private async applyInboundRelations(path: string, doc: VTodoDocument): Promise<void> {
 		const { parents, dependencies } = readRelations(doc);
 		const reminders = readReminders(doc);
 
 		const projects: string[] = [];
 		for (const uid of parents) {
-			const parentPath = await this.findPathForUid(account.id, uid);
+			const parentPath = await this.findPathForUid(uid);
 			const file = parentPath ? this.getFile(parentPath) : null;
 			if (file) projects.push(this.wikilink(file, path));
 		}
 
 		const blockedBy: TaskDependency[] = [];
 		for (const dependency of dependencies) {
-			const targetPath = await this.findPathForUid(account.id, dependency.uid);
+			const targetPath = await this.findPathForUid(dependency.uid);
 			const file = targetPath ? this.getFile(targetPath) : null;
 			if (file) blockedBy.push({ ...dependency, uid: this.wikilink(file, path) });
 		}
@@ -815,13 +1047,13 @@ export class CalDavSyncService {
 	 * Deferred to the end of a run because a relation can only be written once
 	 * both ends exist in the vault, and imports arrive in server order.
 	 */
-	private async flushInboundRelations(account: CalDavAccountSettings): Promise<void> {
+	private async flushInboundRelations(): Promise<void> {
 		const pending = this.pendingInboundRelations;
 		this.pendingInboundRelations = [];
 
 		for (const entry of pending) {
 			try {
-				await this.applyInboundRelations(account, entry.path, entry.doc);
+				await this.applyInboundRelations(entry.path, entry.doc);
 			} catch (error) {
 				this.logError("Failed to apply imported relations", error, {
 					operation: "caldav-flush-inbound-relations",
@@ -831,9 +1063,9 @@ export class CalDavSyncService {
 		}
 	}
 
-	private async flushRelations(account: CalDavAccountSettings): Promise<void> {
-		await this.flushInboundRelations(account);
-		await this.flushPendingRelations(account.id);
+	private async flushRelations(): Promise<void> {
+		await this.flushInboundRelations();
+		await this.flushPendingRelations();
 	}
 
 	/**
@@ -842,33 +1074,32 @@ export class CalDavSyncService {
 	 * Without this a new subtask shows no parent on the server until the next
 	 * poll, which can be a quarter of an hour away.
 	 */
-	private scheduleRelationFlush(accountId: string): void {
-		if (this.destroyed || this.relationFlushTimers.has(accountId)) return;
+	private scheduleRelationFlush(): void {
+		if (this.destroyed || this.relationFlushTimer !== null) return;
 
-		const timer = window.setTimeout(() => {
-			this.relationFlushTimers.delete(accountId);
-			void this.flushPendingRelations(accountId).catch((error: unknown) => {
+		this.relationFlushTimer = window.setTimeout(() => {
+			this.relationFlushTimer = null;
+			void this.flushPendingRelations().catch((error: unknown) => {
 				this.logError("Failed to replay deferred relations", error, {
 					operation: "caldav-flush-relations",
 				});
 			});
 		}, this.settings.pushDebounceMs * 2);
-		this.relationFlushTimers.set(accountId, timer);
 	}
 
 	/** Re-pushes tasks whose relations could not be addressed on the first pass. */
-	private async flushPendingRelations(accountId: string): Promise<void> {
+	private async flushPendingRelations(): Promise<void> {
 		const paths = [...this.pendingRelationPaths];
 		this.pendingRelationPaths.clear();
 		if (paths.length === 0) return;
 
 		// Exactly one extra pass: a parent that is still unaddressable is archived
-		// or lives in another account, and retrying would never change that.
+		// or not synced, and retrying would never change that.
 		this.flushingRelations = true;
 		try {
 			for (const path of paths) {
 				try {
-					await this.pushTask(accountId, path);
+					await this.pushTask(path);
 				} catch (error) {
 					this.logError("Failed to push deferred relations", error, {
 						operation: "caldav-flush-relations",
@@ -891,8 +1122,8 @@ export class CalDavSyncService {
 	}
 
 	/** Applies the configured policy when a VTODO disappears from the server. */
-	private async applyRemoteDeletion(account: CalDavAccountSettings, path: string): Promise<void> {
-		const outcome = planRemoteDeletion(account.remoteDeletionPolicy);
+	private async applyRemoteDeletion(target: SyncTarget, path: string): Promise<void> {
+		const outcome = planRemoteDeletion(target.account.remoteDeletionPolicy);
 		const task = await this.api.tasks.get(path);
 		if (!task) return;
 
@@ -922,104 +1153,136 @@ export class CalDavSyncService {
 	// First sync
 	// -----------------------------------------------------------------------
 
-	/** Computes the first-sync plan without writing anything — the dry run. */
-	async previewFirstSync(accountId: string): Promise<FirstSyncPlan> {
+	/**
+	 * Computes the first-sync plan of every list of the account still waiting
+	 * for one, without writing anything — the dry run.
+	 */
+	async previewFirstSync(accountId: string): Promise<ListFirstSyncPreview[]> {
 		const account = this.getAccount(accountId);
 		if (!account) throw new Error(`Unknown CalDAV account ${accountId}`);
+		const pending = account.lists.filter((list) => !list.initialSyncCompleted);
+		for (const list of pending) {
+			// Imports into it would carry no tag, and the next poll would route
+			// them off to the default list.
+			if (list.tags.length === 0 && list.id !== account.defaultListId) {
+				throw new Error(`"${list.name || list.url}" has no tags and is not the default list. Give it a tag first`);
+			}
+		}
 
-		const remotes = await this.fetchRemoteSnapshots(this.createClient(account), account);
-		const locals = await this.snapshotAccountTasks(account);
-		return planFirstSync(locals, remotes);
+		const client = this.createClient(account);
+		const tasks = await this.api.tasks.list();
+		const previews: ListFirstSyncPreview[] = [];
+		for (const list of pending) {
+			const target = { account, list };
+			const remotes = await this.fetchRemoteSnapshots(client, list);
+			const locals = await this.snapshotListTasks(target, list.id);
+			const moveIn = tasks
+				.filter((task) => {
+					const linked = this.listIdAt(task.path);
+					return linked !== undefined && linked !== list.id && this.routeTarget(task, list.id)?.list === list;
+				})
+				.map((task) => task.path);
+			previews.push({ list, plan: planFirstSync(locals, remotes), moveIn });
+		}
+		return previews;
 	}
 
-	/** Applies a plan the user has confirmed. Resolves with the tasks that failed, already logged. */
-	async applyFirstSync(accountId: string, plan: FirstSyncPlan): Promise<SyncFailure[]> {
+	/**
+	 * Applies previews the user has confirmed and marks each list live.
+	 * Resolves with the tasks that failed, already logged.
+	 */
+	async applyFirstSync(accountId: string, previews: readonly ListFirstSyncPreview[]): Promise<SyncFailure[]> {
 		const account = this.getAccount(accountId);
 		if (!account) return [];
 		const failures: SyncFailure[] = [];
 
-		for (const local of plan.toUpload) {
-			await this.isolate(failures, local.path, () => this.pushTask(accountId, local.path));
-		}
+		for (const { list, plan, moveIn } of previews) {
+			const target = { account, list };
+			list.initialSyncCompleted = true;
+			await this.plugin.saveSettings();
 
-		for (const remote of plan.toImport) {
-			const withData = remote as RemoteSnapshotWithData;
-			if (withData.data) {
-				await this.isolate(failures, `server task ${remote.uid}`, () =>
-					this.applyRemotePatch(account, undefined, withData)
-				);
+			for (const local of [...plan.toUpload.map((entry) => entry.path), ...moveIn]) {
+				await this.isolate(failures, local, async () => {
+					const task = await this.api.tasks.get(local);
+					if (task) await this.putTask(target, task);
+				});
 			}
-		}
 
-		for (const pair of plan.toLink) {
-			await this.isolate(failures, pair.local.path, async () => {
-				await this.stampSyncMetadata(pair.local.path, {
-					uid: pair.remote.uid,
-					href: pair.remote.url,
-					etag: pair.remote.etag,
-					accountId: account.id,
-				});
-				await this.indexResource({
-					accountId: account.id,
-					uid: pair.remote.uid,
-					path: pair.local.path,
-					href: pair.remote.url,
-				});
-			});
-		}
-
-		for (const pair of plan.toResolve) {
-			await this.isolate(failures, pair.local.path, async () => {
-				if (pair.winner === "local") {
-					await this.pushTask(accountId, pair.local.path);
-					return;
+			for (const remote of plan.toImport) {
+				const withData = remote as RemoteSnapshotWithData;
+				if (withData.data) {
+					await this.isolate(failures, `server task ${remote.uid}`, () =>
+						this.applyRemotePatch(target, undefined, withData)
+					);
 				}
-				const withData = pair.remote as RemoteSnapshotWithData;
-				if (withData.data) await this.applyRemotePatch(account, pair.local.path, withData);
+			}
+
+			for (const pair of plan.toLink) {
+				await this.isolate(failures, pair.local.path, async () => {
+					await this.stampSyncMetadata(pair.local.path, {
+						uid: pair.remote.uid,
+						href: pair.remote.url,
+						etag: pair.remote.etag,
+						listId: list.id,
+					});
+					await this.indexResource({ uid: pair.remote.uid, path: pair.local.path, href: pair.remote.url });
+				});
+			}
+
+			for (const pair of plan.toResolve) {
+				await this.isolate(failures, pair.local.path, async () => {
+					if (pair.winner === "local") {
+						const task = await this.api.tasks.get(pair.local.path);
+						if (task) await this.putTask(target, task);
+						return;
+					}
+					const withData = pair.remote as RemoteSnapshotWithData;
+					if (withData.data) await this.applyRemotePatch(target, pair.local.path, withData);
+				});
+			}
+
+			this.logger.info("Completed first CalDAV sync", {
+				operation: "first-sync",
+				details: { listId: list.id, ...summarizeFirstSyncPlan(plan), moveIn: moveIn.length },
 			});
 		}
 
 		// Only now does every task on both sides have both a path and a UID, so
 		// this is the first point at which relations can be written at all.
-		await this.flushRelations(account);
-
-		this.logger.info("Completed first CalDAV sync", {
-			operation: "first-sync",
-			details: { accountId, ...summarizeFirstSyncPlan(plan), failed: failures.length },
-		});
+		await this.flushRelations();
 		return failures;
 	}
 
 	// -----------------------------------------------------------------------
-	// Snapshots and scope
+	// Snapshots and routing
 	// -----------------------------------------------------------------------
 
 	private async fetchRemoteSnapshots(
 		client: CalDavClient,
-		account: CalDavAccountSettings
+		list: CalDavTaskList
 	): Promise<RemoteSnapshotWithData[]> {
-		return (await client.fetchAllVTodos(account.collectionUrl))
+		return (await client.fetchAllVTodos(list.url))
 			.map((resource) => toRemoteSnapshot(resource.url, resource.etag, resource.data))
 			.filter((snapshot): snapshot is RemoteSnapshotWithData => snapshot !== null);
 	}
 
-	private async snapshotAccountTasks(account: CalDavAccountSettings): Promise<LocalTaskSnapshot[]> {
-		const scope = scopeFor(account);
+	/**
+	 * The tasks linked to a list, plus unlinked ones routed to it. A task
+	 * linked here stays in the snapshot even when it no longer routes here, so
+	 * the pass that sees it can move it rather than strand it on the server.
+	 */
+	private async snapshotListTasks(target: SyncTarget, activating?: string): Promise<LocalTaskSnapshot[]> {
 		const snapshots: LocalTaskSnapshot[] = [];
 
 		for (const task of await this.api.tasks.list()) {
 			const file = this.getFile(task.path);
 			if (!file) continue;
 
-			const ownedByAccount =
-				asString(this.readFrontmatter(file)?.[CALDAV_FRONTMATTER_KEYS.account]) === account.id;
-
-			// A task already linked to this account stays in scope even if it no
-			// longer matches the scope, so it can be unlinked deliberately rather
-			// than silently stranded on the server.
-			if (!ownedByAccount && !taskBelongsToCollection(task, scope)) continue;
-
-			snapshots.push(this.snapshotTask(task, file));
+			const linkedId = this.listIdAt(task.path);
+			const belongs =
+				linkedId === target.list.id ||
+				(!this.findTarget(linkedId) && this.routeTarget(task, activating)?.list === target.list);
+			if (belongs) snapshots.push(this.snapshotTask(task, file));
 		}
 
 		return snapshots;
@@ -1038,24 +1301,19 @@ export class CalDavSyncService {
 		};
 	}
 
-	private resolveAccountForTask(task: TaskInfo): CalDavAccountSettings | undefined {
-		const owner = asString(this.readFrontmatterAt(task.path)?.[CALDAV_FRONTMATTER_KEYS.account]);
-		if (owner) {
-			const account = this.getAccount(owner);
-			if (account?.enabled) return account;
-		}
-		return this.enabledAccounts().find((account) =>
-			taskBelongsToCollection(task, scopeFor(account))
-		);
-	}
-
-	private mappingContext(account: CalDavAccountSettings): VTodoMappingContext {
+	private mappingContext(target: SyncTarget): VTodoMappingContext {
 		return {
 			statuses: this.api.catalog.statuses(),
 			priorities: this.api.catalog.priorities(),
-			statusOverrides: account.statusOverrides,
-			hiddenTags: this.settings.syncTaskTag ? [] : this.taskTags(),
+			statusOverrides: target.account.statusOverrides,
+			// The list already says what its routing tags would.
+			hiddenTags: [...(this.settings.syncTaskTag ? [] : this.taskTags()), ...target.list.tags],
 		};
+	}
+
+	/** Tags a phone app cannot remove from a note, because the server never shows them. */
+	private protectedTags(list: CalDavTaskList): string[] {
+		return [...this.taskTags(), ...list.tags];
 	}
 
 	/** The tag TaskNotes recognises task notes by, when it identifies them by tag. */
@@ -1070,14 +1328,14 @@ export class CalDavSyncService {
 
 	private async stampSyncMetadata(
 		path: string,
-		metadata: { uid: string; href: string; etag?: string; accountId: string }
+		metadata: { uid: string; href: string; etag?: string; listId: string }
 	): Promise<void> {
 		const file = this.requireFile(path);
 
 		await this.plugin.app.fileManager.processFrontMatter(file, (frontmatter) => {
 			frontmatter[CALDAV_FRONTMATTER_KEYS.uid] = metadata.uid;
 			frontmatter[CALDAV_FRONTMATTER_KEYS.href] = metadata.href;
-			frontmatter[CALDAV_FRONTMATTER_KEYS.account] = metadata.accountId;
+			frontmatter[CALDAV_FRONTMATTER_KEYS.account] = metadata.listId;
 			frontmatter[CALDAV_FRONTMATTER_KEYS.syncedAt] = new Date().toISOString();
 			if (metadata.etag) {
 				frontmatter[CALDAV_FRONTMATTER_KEYS.etag] = metadata.etag;
@@ -1104,6 +1362,11 @@ export class CalDavSyncService {
 
 	private readFrontmatter(file: TFile): Record<string, unknown> | undefined {
 		return this.plugin.app.metadataCache.getFileCache(file)?.frontmatter;
+	}
+
+	/** The list a note is linked to. */
+	private listIdAt(path: string): string | undefined {
+		return asString(this.readFrontmatterAt(path)?.[CALDAV_FRONTMATTER_KEYS.account]);
 	}
 
 	private readFrontmatterAt(path: string): Record<string, unknown> | undefined {
@@ -1141,18 +1404,15 @@ export class CalDavSyncService {
 
 	private async indexResource(entry: CalDavResourceIndexEntry): Promise<void> {
 		this.state.resourceIndex = this.state.resourceIndex.filter(
-			(existing) =>
-				!(existing.accountId === entry.accountId && existing.uid === entry.uid) &&
-				existing.path !== entry.path
+			(existing) => existing.uid !== entry.uid && existing.path !== entry.path
 		);
 		this.state.resourceIndex.push(entry);
 		await this.plugin.saveState();
 	}
 
-	private async findPathForUid(accountId: string, uid: string): Promise<string | undefined> {
-		const entry = this.state.resourceIndex.find(
-			(candidate) => candidate.accountId === accountId && candidate.uid === uid
-		);
+	/** UIDs are global, so this finds the task whichever list it is in. */
+	private async findPathForUid(uid: string): Promise<string | undefined> {
+		const entry = this.state.resourceIndex.find((candidate) => candidate.uid === uid);
 		if (entry && this.getFile(entry.path)) return entry.path;
 
 		// The index can go stale when a task is renamed while this plugin is off;
@@ -1190,7 +1450,7 @@ export class CalDavSyncService {
 			);
 		}
 		return new CalDavClient({
-			serverUrl: account.serverUrl || account.collectionUrl,
+			serverUrl: account.serverUrl || account.lists[0]?.url || "",
 			credentials,
 			logger: createLogger("CalDavClient"),
 		});
@@ -1246,13 +1506,17 @@ function toTaskUpdate(
 	return updates as Partial<TaskInfo>;
 }
 
-function scopeFor(account: CalDavAccountSettings): CalDavCollectionScope {
+function routingFor(account: CalDavAccountSettings): AccountRouting {
 	return {
-		accountId: account.id,
-		tags: account.scopeTags,
-		tagMode: account.scopeTagMode,
+		lists: account.lists.map(routeOf),
+		defaultListId: account.defaultListId || undefined,
+		excludeTags: account.excludeTags,
 		folder: account.scopeFolder,
 	};
+}
+
+function routeOf(list: CalDavTaskList): TaskListRoute {
+	return { listId: list.id, tags: list.tags };
 }
 
 /**

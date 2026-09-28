@@ -10,10 +10,15 @@ import { App, ButtonComponent, Modal, Notice, PluginSettingTab, Setting, setIcon
 import type CalDavPlugin from "./main";
 import { CalDavClient, CalDavError, type CalDavCollectionInfo } from "./caldav/CalDavClient";
 import { CalDavSecretStore } from "./caldav/CalDavSecretStore";
-import { noticeFailures } from "./CalDavSyncService";
+import { noticeFailures, type ListFirstSyncPreview } from "./CalDavSyncService";
 import { summarizeFirstSyncPlan } from "./caldav/caldavReconciliation";
 import { createLogger } from "./log";
-import { DEFAULT_ACCOUNT, type CalDavAccountSettings, type CalDavRemoteDeletionPolicy } from "./settings";
+import {
+	DEFAULT_ACCOUNT,
+	type CalDavAccountSettings,
+	type CalDavRemoteDeletionPolicy,
+	type CalDavTaskList,
+} from "./settings";
 
 const logger = createLogger("Settings");
 
@@ -88,7 +93,7 @@ export class CalDavSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Add account")
-			.setDesc("Configure another CalDAV task list.")
+			.setDesc("Connect another CalDAV server or login.")
 			.addButton((button) =>
 				button.setButtonText("Add account").onClick(() => {
 					this.settings.accounts.push({
@@ -154,34 +159,13 @@ export class CalDavSettingTab extends PluginSettingTab {
 				})
 			);
 
-		const discovered = this.discovered.get(account.id);
-		const listSetting = new Setting(body).setName("Task list");
-		if (discovered && discovered.length > 1) {
-			// Several task lists can share a display name, so the URL is the only
-			// thing that reliably tells them apart.
-			listSetting.setDesc("Choose which list this account syncs with.").addDropdown((dropdown) => {
-				for (const collection of discovered) {
-					dropdown.addOption(collection.url, `${collection.displayName} (${collection.url})`);
-				}
-				dropdown.setValue(account.collectionUrl).onChange((value) => {
-					account.collectionUrl = value;
-					this.save();
-					refreshHeader();
-				});
-			});
-		} else {
-			listSetting.setDesc(
-				account.collectionUrl || "None selected yet. Use Discover below to find the lists this account can reach."
-			);
-		}
-
-		this.renderTagFilter(body, account);
+		this.renderLists(body, account);
 		this.text(
 			body,
 			account,
 			"scopeFolder",
 			"Only tasks in folder",
-			"Sync only tasks inside this folder (subfolders included). Leave empty for no folder restriction.",
+			"Pick up only tasks inside this folder (subfolders included). Leave empty for no folder restriction.",
 			"TaskNotes/Work"
 		);
 
@@ -226,11 +210,8 @@ export class CalDavSettingTab extends PluginSettingTab {
 				})
 			);
 
-		this.actionButton(actions, "search", "Discover task lists").onClick(
-			() => void this.discoverCollections(account)
-		);
 		this.actionButton(actions, "git-compare", "Preview first sync")
-			.setTooltip("Compare this task list against your vault before anything is written")
+			.setTooltip("Compare new task lists against your vault before anything is written")
 			.setCta()
 			.onClick(() => void this.runFirstSyncPreview(account));
 		actions.createDiv({ cls: "tasknotes-caldav-account__spacer" });
@@ -248,33 +229,126 @@ export class CalDavSettingTab extends PluginSettingTab {
 		return button;
 	}
 
-	private renderTagFilter(body: HTMLElement, account: CalDavAccountSettings): void {
-		const setting = new Setting(body)
-			.setName("Tag filter")
-			.setDesc("Nested tags count too: work also matches work/client. Leave the list empty to sync every task.")
-			.addDropdown((dropdown) =>
-				dropdown
-					.addOptions({
-						include: "Only tasks with these tags",
-						exclude: "All tasks except these tags",
-					})
-					.setValue(account.scopeTagMode)
-					.onChange((value) => {
-						account.scopeTagMode = value as CalDavAccountSettings["scopeTagMode"];
-						this.save();
-					})
+	/**
+	 * The routing table: one row per list with the tags that send tasks there,
+	 * then where everything else goes and what never syncs.
+	 */
+	private renderLists(body: HTMLElement, account: CalDavAccountSettings): void {
+		new Setting(body)
+			.setName("Task lists")
+			.setDesc("A task goes to the first list whose tags it has. When its tags change, it moves.")
+			.setHeading()
+			.addButton((button) =>
+				button.setButtonText("Discover").onClick(() => void this.discoverCollections(account))
 			);
 
-		const list = setting.descEl.createDiv({ cls: "tasknotes-caldav-tags" });
+		account.lists.forEach((list, index) => {
+			const row = new Setting(body).setName(list.name || list.url).setClass("tasknotes-caldav-list");
+			row.nameEl.createSpan({
+				cls: `tasknotes-caldav-list__status is-${list.initialSyncCompleted ? "syncing" : "setup"}`,
+				text: list.initialSyncCompleted ? "Syncing" : "Needs first sync",
+			});
+			const hint = list.id === account.defaultListId ? "Also takes everything else." : "Add at least one tag.";
+			this.renderTagChips(row.descEl, list.tags, list.tags.length === 0 ? hint : "", (tags) => {
+				list.tags = tags;
+				this.save();
+			});
+			row.addExtraButton((button) =>
+				button
+					.setIcon("arrow-up")
+					.setTooltip("Try this list earlier")
+					.setDisabled(index === 0)
+					.onClick(() => {
+						account.lists.splice(index - 1, 0, ...account.lists.splice(index, 1));
+						this.save();
+						this.display();
+					})
+			);
+			row.addExtraButton((button) =>
+				button
+					.setIcon("x")
+					.setTooltip("Stop syncing this list")
+					.onClick(() => void this.removeList(account, list))
+			);
+		});
+
+		const unrouted = (this.discovered.get(account.id) ?? []).filter(
+			(collection) => !account.lists.some((list) => list.url === collection.url)
+		);
+		const add = new Setting(body).setName("Route another list");
+		if (unrouted.length === 0) {
+			add.setDesc(
+				this.discovered.has(account.id)
+					? "Every list on this server is already routed."
+					: "Use Discover to find the lists this account can reach."
+			);
+		} else {
+			add.addDropdown((dropdown) => {
+				dropdown.addOption("", "Choose a list");
+				for (const collection of unrouted) dropdown.addOption(collection.url, collection.displayName);
+				dropdown.onChange((url) => {
+					this.addList(account, url);
+					this.display();
+				});
+			});
+		}
+
+		new Setting(body)
+			.setName("Everything else")
+			.setDesc("Where tasks go that have none of the tags above.")
+			.addDropdown((dropdown) => {
+				dropdown.addOption("", "Don't sync");
+				for (const list of account.lists) dropdown.addOption(list.id, list.name || list.url);
+				for (const collection of unrouted) dropdown.addOption(collection.url, collection.displayName);
+				dropdown.setValue(account.defaultListId).onChange((value) => {
+					account.defaultListId = account.lists.some((list) => list.id === value)
+						? value
+						: value && this.addList(account, value).id;
+					this.save();
+					this.display();
+				});
+			});
+
+		const never = new Setting(body).setName("Never sync");
+		this.renderTagChips(never.descEl, account.excludeTags, "Tasks with any of these tags are not picked up.", (tags) => {
+			account.excludeTags = tags;
+			this.save();
+		});
+	}
+
+	private addList(account: CalDavAccountSettings, url: string): CalDavTaskList {
+		const collection = this.discovered.get(account.id)?.find((candidate) => candidate.url === url);
+		const list: CalDavTaskList = {
+			id: `list-${Date.now().toString(36)}`,
+			url,
+			name: collection?.displayName ?? "",
+			tags: [],
+			initialSyncCompleted: false,
+		};
+		account.lists.push(list);
+		this.save();
+		return list;
+	}
+
+	/** Tag chips with a remove button each, and an input that adds one on Enter. */
+	private renderTagChips(
+		parent: HTMLElement,
+		initial: readonly string[],
+		hint: string,
+		onChange: (tags: string[]) => void
+	): void {
+		let tags = [...initial];
+		if (hint) parent.createDiv({ text: hint });
+		const list = parent.createDiv({ cls: "tasknotes-caldav-tags" });
 		const render = () => {
 			list.empty();
-			for (const tag of account.scopeTags) {
+			for (const tag of tags) {
 				const chip = list.createSpan({ cls: "tasknotes-caldav-tags__chip", text: `#${tag}` });
 				const remove = chip.createSpan({ cls: "tasknotes-caldav-tags__remove", attr: { "aria-label": `Remove #${tag}` } });
 				setIcon(remove, "x");
 				remove.onclick = () => {
-					account.scopeTags = account.scopeTags.filter((candidate) => candidate !== tag);
-					this.save();
+					tags = tags.filter((candidate) => candidate !== tag);
+					onChange(tags);
 					render();
 				};
 			}
@@ -285,10 +359,10 @@ export class CalDavSettingTab extends PluginSettingTab {
 			input.onkeydown = (event) => {
 				if (event.key !== "Enter") return;
 				const tag = input.value.trim().replace(/^#/u, "");
-				const known = account.scopeTags.some((existing) => existing.toLowerCase() === tag.toLowerCase());
+				const known = tags.some((existing) => existing.toLowerCase() === tag.toLowerCase());
 				if (tag && !known) {
-					account.scopeTags = [...account.scopeTags, tag];
-					this.save();
+					tags = [...tags, tag];
+					onChange(tags);
 				}
 				render();
 				list.querySelector<HTMLInputElement>(".tasknotes-caldav-tags__input")?.focus();
@@ -305,7 +379,7 @@ export class CalDavSettingTab extends PluginSettingTab {
 		info.createDiv({ cls: "tasknotes-caldav-account__title", text: account.name || "Unnamed account" });
 		info.createDiv({
 			cls: "tasknotes-caldav-account__subtitle",
-			text: account.collectionUrl || account.serverUrl || "CalDAV task list",
+			text: account.lists.map((list) => list.name || list.url).join(", ") || account.serverUrl || "CalDAV server",
 		});
 		header.createSpan({ cls: `tasknotes-caldav-account__badge is-${status.kind}`, text: status.label });
 	}
@@ -314,10 +388,13 @@ export class CalDavSettingTab extends PluginSettingTab {
 		kind: "syncing" | "paused" | "setup";
 		label: string;
 	} {
-		if (!this.secretStore.hasCredentials(account.id) || !account.collectionUrl) {
+		if (!this.secretStore.hasCredentials(account.id) || account.lists.length === 0) {
 			return { kind: "setup", label: "Setup incomplete" };
 		}
 		if (!account.enabled) return { kind: "paused", label: "Paused" };
+		if (account.lists.some((list) => !list.initialSyncCompleted)) {
+			return { kind: "setup", label: "First sync pending" };
+		}
 		return { kind: "syncing", label: "Syncing" };
 	}
 
@@ -353,10 +430,7 @@ export class CalDavSettingTab extends PluginSettingTab {
 		}
 
 		try {
-			const client = new CalDavClient({
-				serverUrl: account.serverUrl || account.collectionUrl,
-				credentials,
-			});
+			const client = new CalDavClient({ serverUrl: account.serverUrl, credentials });
 			const collections = await client.discoverCollections();
 			if (collections.length === 0) {
 				new Notice("No task lists were found for this account.");
@@ -364,14 +438,12 @@ export class CalDavSettingTab extends PluginSettingTab {
 			}
 
 			this.discovered.set(account.id, collections);
-			// Adopt the first result so a single-list account needs no further
-			// input; with several, the dropdown lets the user correct it before
-			// anything is written.
-			if (!collections.some((collection) => collection.url === account.collectionUrl)) {
-				account.collectionUrl = collections[0].url;
+			// Names can change on the server; the stored ones are only for display.
+			for (const list of account.lists) {
+				list.name = collections.find((collection) => collection.url === list.url)?.displayName ?? list.name;
 			}
 			this.save();
-			new Notice(`Found ${collections.length} task list(s). Using "${collections[0].displayName}".`);
+			new Notice(`Found ${collections.length} task list(s).`);
 			this.display();
 		} catch (error) {
 			this.reportError(error);
@@ -383,29 +455,50 @@ export class CalDavSettingTab extends PluginSettingTab {
 			new Notice("CalDAV sync is not running. Check that TaskNotes is enabled.");
 			return;
 		}
-		if (!account.collectionUrl) {
-			new Notice("Choose a task list for this account first.");
-			return;
-		}
 
 		try {
-			const plan = await this.plugin.sync.previewFirstSync(account.id);
-			const summary = summarizeFirstSyncPlan(plan);
+			const previews = await this.plugin.sync.previewFirstSync(account.id);
+			if (previews.length === 0) {
+				new Notice("Every list of this account has had its first sync.");
+				return;
+			}
 
-			// The first sync is the one destructive moment: a mis-scoped account or
-			// a wrong collection is cheap to catch here and expensive afterwards.
+			// The first sync is the one destructive moment: a mis-routed tag or a
+			// wrong list is cheap to catch here and expensive afterwards.
 			const confirmed = await confirm(this.app, {
 				title: "Review the first sync",
-				message: `${summary.upload} to upload, ${summary.import} to import, ${summary.link} already matching, ${summary.resolve} changed on both sides. Nothing has been written yet.`,
+				message: [...previews.map(describePreview), "Nothing has been written yet."],
 				cta: "Sync now",
 			});
 			if (!confirmed) return;
 
-			const failures = await this.plugin.sync.applyFirstSync(account.id, plan);
-			account.initialSyncCompleted = true;
-			this.save();
+			const failures = await this.plugin.sync.applyFirstSync(account.id, previews);
 			if (failures.length > 0) noticeFailures(failures);
 			else new Notice("First sync finished.");
+			this.display();
+		} catch (error) {
+			this.reportError(error);
+		}
+	}
+
+	private async removeList(account: CalDavAccountSettings, list: CalDavTaskList): Promise<void> {
+		if (!this.plugin.sync) {
+			new Notice("CalDAV sync is not running. Check that TaskNotes is enabled.");
+			return;
+		}
+		const name = list.name || list.url;
+		const confirmed = await confirm(this.app, {
+			title: "Stop syncing this list",
+			message: `Stop syncing "${name}"? Its tasks move to the list their tags now route them to. A task with nowhere to go keeps its note but is unlinked, and its copy stays in "${name}" on the server.`,
+			cta: "Stop syncing",
+			destructive: true,
+		});
+		if (!confirmed) return;
+
+		try {
+			const failures = await this.plugin.sync.removeList(account.id, list.id);
+			if (failures.length > 0) noticeFailures(failures);
+			this.display();
 		} catch (error) {
 			this.reportError(error);
 		}
@@ -438,13 +531,13 @@ export class CalDavSettingTab extends PluginSettingTab {
 
 export function confirm(
 	app: App,
-	options: { title: string; message: string; cta: string; destructive?: boolean }
+	options: { title: string; message: string | string[]; cta: string; destructive?: boolean }
 ): Promise<boolean> {
 	return new Promise((resolve) => {
 		const modal = new Modal(app);
 		let confirmed = false;
 		modal.titleEl.setText(options.title);
-		modal.contentEl.createEl("p", { text: options.message });
+		for (const paragraph of [options.message].flat()) modal.contentEl.createEl("p", { text: paragraph });
 		new Setting(modal.contentEl)
 			.addButton((button) => button.setButtonText("Cancel").onClick(() => modal.close()))
 			.addButton((button) => {
@@ -458,4 +551,9 @@ export function confirm(
 		modal.onClose = () => resolve(confirmed);
 		modal.open();
 	});
+}
+
+function describePreview({ list, plan, moveIn }: ListFirstSyncPreview): string {
+	const summary = summarizeFirstSyncPlan(plan);
+	return `${list.name || list.url}: ${summary.upload} to upload, ${summary.import} to import, ${summary.link} already matching, ${summary.resolve} changed on both sides, ${moveIn.length} moving in from other lists.`;
 }

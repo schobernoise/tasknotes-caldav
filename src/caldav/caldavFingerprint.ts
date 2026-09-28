@@ -28,6 +28,8 @@ export const CALDAV_FRONTMATTER_KEYS = {
 	href: "caldav_href",
 	etag: "caldav_etag",
 	syncedAt: "caldav_synced_at",
+	// Holds the task list's id. Named before an account could have several
+	// lists; a pre-0.4.0 account's single list kept the account's id.
 	account: "caldav_account",
 } as const;
 

@@ -6,11 +6,7 @@ import {
 	hasCalDavRelevantChange,
 	parseCalDavFingerprint,
 } from "../../src/caldav/caldavFingerprint";
-import {
-	resolveCollectionForTask,
-	taskBelongsToCollection,
-	type CalDavCollectionScope,
-} from "../../src/caldav/collectionMembership";
+import { retagForList, routeTask, type AccountRouting } from "../../src/caldav/collectionMembership";
 
 function makeTask(overrides: Partial<TaskInfo> & Record<string, unknown> = {}): TaskInfo {
 	return {
@@ -105,101 +101,110 @@ describe("hasCalDavRelevantChange", () => {
 	});
 });
 
-describe("taskBelongsToCollection", () => {
-	it("matches every task when the scope has no tag or folder", () => {
-		expect(taskBelongsToCollection(makeTask(), { accountId: "a" })).toBe(true);
-		expect(taskBelongsToCollection(makeTask(), { accountId: "a", tags: [" "], folder: "" })).toBe(
-			true
-		);
+describe("routeTask", () => {
+	const routing: AccountRouting = {
+		lists: [
+			{ listId: "work", tags: ["#Work", "client"] },
+			{ listId: "home", tags: ["home"] },
+			{ listId: "personal", tags: [] },
+		],
+		defaultListId: "personal",
+	};
+	const route = (overrides: Partial<TaskInfo>, current?: string, custom: Partial<AccountRouting> = {}) =>
+		routeTask(makeTask(overrides), { ...routing, ...custom }, current);
+
+	it("sends a task to the first list whose tags it has, case-insensitively and with or without #", () => {
+		expect(route({ tags: ["work"] })).toBe("work");
+		expect(route({ tags: ["#client"] })).toBe("work");
+		expect(route({ tags: ["home"] })).toBe("home");
+		expect(route({ tags: ["home", "work"] })).toBe("work");
 	});
 
-	it("matches a tag with or without #, case-insensitively, including nested tags", () => {
-		const scope: CalDavCollectionScope = { accountId: "work", tags: ["#Work"] };
-		expect(taskBelongsToCollection(makeTask({ tags: ["work"] }), scope)).toBe(true);
-		expect(taskBelongsToCollection(makeTask({ tags: ["#work/client"] }), scope)).toBe(true);
-		expect(taskBelongsToCollection(makeTask({ tags: ["workshop"] }), scope)).toBe(false);
-		expect(taskBelongsToCollection(makeTask({ tags: ["personal"] }), scope)).toBe(false);
-		expect(taskBelongsToCollection(makeTask(), scope)).toBe(false);
+	it("matches nested tags but not name-prefixed ones", () => {
+		expect(route({ tags: ["work/acme"] })).toBe("work");
+		expect(route({ tags: ["workshop"] })).toBe("personal");
 	});
 
-	it("includes a task carrying any one of several tags", () => {
-		const scope: CalDavCollectionScope = { accountId: "a", tags: ["work", "errand"] };
-		expect(taskBelongsToCollection(makeTask({ tags: ["errand"] }), scope)).toBe(true);
-		expect(taskBelongsToCollection(makeTask({ tags: ["home"] }), scope)).toBe(false);
+	it("sends a task matching no list to the default, or nowhere without one", () => {
+		expect(route({ tags: ["urgent"] })).toBe("personal");
+		expect(route({})).toBe("personal");
+		expect(route({ tags: ["urgent"] }, undefined, { defaultListId: undefined })).toBeUndefined();
 	});
 
-	it("in exclude mode, skips tasks with any listed tag and keeps the rest", () => {
-		const scope: CalDavCollectionScope = {
-			accountId: "a",
-			tags: ["private", "someday"],
-			tagMode: "exclude",
-		};
-		expect(taskBelongsToCollection(makeTask({ tags: ["private/health"] }), scope)).toBe(false);
-		expect(taskBelongsToCollection(makeTask({ tags: ["work", "someday"] }), scope)).toBe(false);
-		expect(taskBelongsToCollection(makeTask({ tags: ["work"] }), scope)).toBe(true);
-		expect(taskBelongsToCollection(makeTask(), scope)).toBe(true);
+	it("keeps a task in its list while it still has one of that list's tags", () => {
+		// No ping-pong: a Work task that gains #home stays in Work.
+		expect(route({ tags: ["home", "work"] }, "home")).toBe("home");
+		expect(route({ tags: ["work", "home"] }, "work")).toBe("work");
 	});
 
-	it("in exclude mode with an empty list, restricts nothing", () => {
-		const scope: CalDavCollectionScope = { accountId: "a", tags: [], tagMode: "exclude" };
-		expect(taskBelongsToCollection(makeTask({ tags: ["private"] }), scope)).toBe(true);
+	it("moves a task whose tags now point elsewhere", () => {
+		expect(route({ tags: ["home"] }, "work")).toBe("home");
+		expect(route({ tags: ["work"] }, "personal")).toBe("work");
 	});
 
-	it("matches a folder and its subfolders, not name-prefixed siblings", () => {
-		const scope: CalDavCollectionScope = { accountId: "a", folder: "/Tasks/Work/" };
-		expect(taskBelongsToCollection(makeTask({ path: "Tasks/Work/a.md" }), scope)).toBe(true);
-		expect(taskBelongsToCollection(makeTask({ path: "Tasks/Work/x/a.md" }), scope)).toBe(true);
-		expect(taskBelongsToCollection(makeTask({ path: "Tasks/Workshop/a.md" }), scope)).toBe(false);
-		expect(taskBelongsToCollection(makeTask({ path: "Tasks/a.md" }), scope)).toBe(false);
+	it("moves a task that lost its list's tag to the default", () => {
+		expect(route({ tags: ["urgent"] }, "work")).toBe("personal");
 	});
 
-	it("requires both tag and folder when both are set", () => {
-		const scope: CalDavCollectionScope = { accountId: "a", tags: ["work"], folder: "Tasks" };
-		expect(taskBelongsToCollection(makeTask({ tags: ["work"] }), scope)).toBe(true);
-		expect(
-			taskBelongsToCollection(makeTask({ tags: ["work"], path: "Other/a.md" }), scope)
-		).toBe(false);
-		expect(taskBelongsToCollection(makeTask({ tags: ["home"] }), scope)).toBe(false);
+	it("leaves a linked task where it is when nothing else takes it", () => {
+		// A tag edit must never delete a task from the server.
+		expect(route({ tags: ["urgent"] }, "work", { defaultListId: undefined })).toBe("work");
 	});
 
-	it("never includes an archived task", () => {
+	it("keeps a task in a list without tags until a tagged list wants it", () => {
+		expect(route({ tags: ["urgent"] }, "personal")).toBe("personal");
+		expect(route({ tags: ["home"] }, "personal")).toBe("home");
+	});
+
+	it("applies exclude tags and the folder only to tasks not linked yet", () => {
+		const custom = { excludeTags: ["private"], folder: "/Tasks/" };
+		expect(route({ tags: ["work", "private/health"] }, undefined, custom)).toBeUndefined();
+		expect(route({ tags: ["work"], path: "Other/a.md" }, undefined, custom)).toBeUndefined();
+		expect(route({ tags: ["work"], path: "Tasks/x/a.md" }, undefined, custom)).toBe("work");
+		expect(route({ tags: ["work", "private"] }, "work", custom)).toBe("work");
+	});
+
+	it("does not match a folder by name prefix", () => {
+		expect(route({ path: "Tasks/Workshop/a.md" }, undefined, { folder: "Tasks/Work" })).toBeUndefined();
+	});
+
+	it("never picks up an archived task, but does not evict a linked one", () => {
 		// Archiving is how a remote deletion is reflected locally; re-uploading
 		// archived tasks would resurrect VTODOs the user deleted on the server.
-		expect(taskBelongsToCollection(makeTask({ archived: true }), { accountId: "a" })).toBe(
-			false
-		);
+		expect(route({ archived: true })).toBeUndefined();
+		expect(route({ archived: true, tags: ["work"] }, "work")).toBe("work");
+	});
+
+	it("routes a task out of a removed list by its tags, ignoring exclusions since it is already on the server", () => {
+		expect(route({ tags: ["home"] }, "gone")).toBe("home");
+		expect(route({ tags: ["private"] }, "gone", { excludeTags: ["private"] })).toBe("personal");
 	});
 });
 
-describe("resolveCollectionForTask", () => {
-	const scopes: CalDavCollectionScope[] = [
-		{ accountId: "work", tags: ["work"] },
-		{ accountId: "personal", tags: ["personal"] },
-		{ accountId: "catch-all" },
-	];
+describe("retagForList", () => {
+	const work = { listId: "work", tags: ["work", "client"] };
+	const home = { listId: "home", tags: ["#home", "errand"] };
+	const personal = { listId: "personal", tags: [] };
 
-	it("returns the first matching collection", () => {
-		expect(resolveCollectionForTask(makeTask({ tags: ["personal"] }), scopes)?.accountId).toBe(
-			"personal"
-		);
+	it("swaps the old list's routing tags for the new list's first tag", () => {
+		expect(retagForList(["task", "Work", "urgent"], work, home)).toEqual(["task", "urgent", "home"]);
 	});
 
-	it("assigns a task to exactly one collection when several match", () => {
-		// Order decides, so a task is uploaded once rather than duplicated.
-		expect(
-			resolveCollectionForTask(makeTask({ tags: ["work", "personal"] }), scopes)?.accountId
-		).toBe("work");
+	it("keeps nested tags, which are the user's own", () => {
+		expect(retagForList(["work/acme"], work, home)).toEqual(["work/acme", "home"]);
 	});
 
-	it("falls through to an unscoped collection", () => {
-		expect(resolveCollectionForTask(makeTask({ tags: ["other"] }), scopes)?.accountId).toBe(
-			"catch-all"
-		);
+	it("adds nothing when the task already qualifies for the new list", () => {
+		expect(retagForList(["errand"], work, home)).toEqual(["errand"]);
+		expect(retagForList(["home/garden"], undefined, home)).toEqual(["home/garden"]);
 	});
 
-	it("returns undefined when nothing matches", () => {
-		expect(
-			resolveCollectionForTask(makeTask({ tags: ["other"] }), scopes.slice(0, 2))
-		).toBeUndefined();
+	it("adds nothing for a list without tags", () => {
+		expect(retagForList(["work", "urgent"], work, personal)).toEqual(["urgent"]);
+		expect(retagForList(["urgent"], undefined, personal)).toEqual(["urgent"]);
+	});
+
+	it("tags an import into a tagged list", () => {
+		expect(retagForList([], undefined, work)).toEqual(["work"]);
 	});
 });

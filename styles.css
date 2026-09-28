@@ -142,3 +142,18 @@
 	min-width: 10em;
 	font-size: var(--font-ui-smaller);
 }
+
+/* Task list rows: a status label after the list name. */
+.tasknotes-caldav-list__status {
+	margin-left: 8px;
+	font-size: var(--font-ui-smaller);
+	font-weight: var(--font-semibold);
+}
+
+.tasknotes-caldav-list__status.is-syncing {
+	color: var(--color-green);
+}
+
+.tasknotes-caldav-list__status.is-setup {
+	color: var(--color-orange);
+}
