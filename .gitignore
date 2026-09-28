@@ -130,3 +130,7 @@ dist
 .yarn/install-state.gz
 .pnp.*
 
+
+# Build output
+main.js
+data.json
