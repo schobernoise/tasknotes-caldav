@@ -1,6 +1,6 @@
 {
 	"name": "tasknotes-caldav",
-	"version": "0.2.0",
+	"version": "0.3.0",
 	"description": "Two-way CalDAV VTODO sync companion plugin for TaskNotes",
 	"main": "main.js",
 	"private": true,
