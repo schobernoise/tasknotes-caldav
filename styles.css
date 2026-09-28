@@ -1,0 +1,102 @@
+/* One card per CalDAV account, modelled on TaskNotes' integration cards. */
+
+.tasknotes-caldav-account {
+	margin: 16px 0;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-m);
+	background: var(--background-primary);
+	overflow: hidden;
+}
+
+.tasknotes-caldav-account:hover {
+	border-color: var(--interactive-accent);
+}
+
+.tasknotes-caldav-account__header {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	padding: 12px 16px;
+	background: var(--background-secondary);
+	border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.tasknotes-caldav-account__dot {
+	flex: none;
+	width: 10px;
+	height: 10px;
+	border-radius: 50%;
+}
+
+.tasknotes-caldav-account__info {
+	flex: 1;
+	min-width: 0;
+}
+
+.tasknotes-caldav-account__title {
+	font-weight: var(--font-semibold);
+	color: var(--text-normal);
+}
+
+.tasknotes-caldav-account__subtitle {
+	font-size: var(--font-ui-smaller);
+	color: var(--text-muted);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.tasknotes-caldav-account__badge {
+	flex: none;
+	padding: 2px 10px;
+	border-radius: var(--radius-l);
+	font-size: var(--font-ui-smaller);
+	font-weight: var(--font-semibold);
+	color: var(--text-on-accent);
+}
+
+.tasknotes-caldav-account__dot.is-syncing,
+.tasknotes-caldav-account__badge.is-syncing {
+	background: var(--color-green);
+}
+
+.tasknotes-caldav-account__dot.is-paused,
+.tasknotes-caldav-account__badge.is-paused {
+	background: var(--text-faint);
+}
+
+.tasknotes-caldav-account__dot.is-setup,
+.tasknotes-caldav-account__badge.is-setup {
+	background: var(--color-orange);
+}
+
+/* Padded here because Obsidian strips the first setting row's top padding. */
+.tasknotes-caldav-account__body {
+	padding: 12px 16px 4px;
+}
+
+.tasknotes-caldav-account__actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	padding: 12px 16px;
+	background: var(--background-secondary);
+	border-top: 1px solid var(--background-modifier-border);
+}
+
+.tasknotes-caldav-account__actions button {
+	gap: 6px;
+}
+
+.tasknotes-caldav-account__button-icon {
+	display: flex;
+}
+
+.tasknotes-caldav-account__button-icon svg {
+	width: var(--icon-s);
+	height: var(--icon-s);
+}
+
+.tasknotes-caldav-account__spacer {
+	flex: 1;
+}

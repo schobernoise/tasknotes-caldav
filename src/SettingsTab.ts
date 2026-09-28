@@ -5,7 +5,7 @@
  * an account, discovering collections) re-renders the whole tab.
  */
 
-import { App, Modal, Notice, PluginSettingTab, Setting } from "obsidian";
+import { App, ButtonComponent, Modal, Notice, PluginSettingTab, Setting, setIcon } from "obsidian";
 
 import type CalDavPlugin from "./main";
 import { CalDavClient, CalDavError, type CalDavCollectionInfo } from "./caldav/CalDavClient";
@@ -89,22 +89,28 @@ export class CalDavSettingTab extends PluginSettingTab {
 	}
 
 	private renderAccount(containerEl: HTMLElement, account: CalDavAccountSettings): void {
-		new Setting(containerEl).setName(account.name || account.id).setHeading();
+		const card = containerEl.createDiv({ cls: "tasknotes-caldav-account" });
+		const header = card.createDiv({ cls: "tasknotes-caldav-account__header" });
+		const body = card.createDiv({ cls: "tasknotes-caldav-account__body" });
+		const actions = card.createDiv({ cls: "tasknotes-caldav-account__actions" });
+		const refreshHeader = () => this.renderAccountHeader(header, account);
+		refreshHeader();
 
-		this.text(containerEl, account, "name", "Name", "A label for this account.");
+		this.text(body, account, "name", "Name", "A label for this account.", "", refreshHeader);
 		this.text(
-			containerEl,
+			body,
 			account,
 			"serverUrl",
 			"Server URL",
 			"Base URL of the CalDAV server. Credentials are only sent over HTTPS, except to localhost.",
-			"https://cloud.example.com/remote.php/dav"
+			"https://cloud.example.com/remote.php/dav",
+			refreshHeader
 		);
-		this.text(containerEl, account, "username", "Username", "The account name on the CalDAV server.");
+		this.text(body, account, "username", "Username", "The account name on the CalDAV server.");
 
 		// Write-only: the password lives in Obsidian's SecretStorage and is never
 		// read back into the UI.
-		new Setting(containerEl)
+		new Setting(body)
 			.setName("Password")
 			.setDesc(
 				this.secretStore.hasCredentials(account.id)
@@ -120,6 +126,7 @@ export class CalDavSettingTab extends PluginSettingTab {
 							username: account.username,
 							password: value,
 						});
+						refreshHeader();
 					} catch (error) {
 						logger.error("Could not store CalDAV credentials", { error });
 						new Notice("Could not save the password to secret storage.");
@@ -133,35 +140,29 @@ export class CalDavSettingTab extends PluginSettingTab {
 				})
 			);
 
-		new Setting(containerEl)
-			.setName("Task list")
-			.setDesc("Find the task lists this account can reach.")
-			.addButton((button) =>
-				button.setButtonText("Discover").onClick(() => void this.discoverCollections(account))
-			);
-
 		const discovered = this.discovered.get(account.id);
+		const listSetting = new Setting(body).setName("Task list");
 		if (discovered && discovered.length > 1) {
 			// Several task lists can share a display name, so the URL is the only
 			// thing that reliably tells them apart.
-			new Setting(containerEl)
-				.setName("Selected task list")
-				.setDesc("Choose which list this account syncs with.")
-				.addDropdown((dropdown) => {
-					for (const collection of discovered) {
-						dropdown.addOption(collection.url, `${collection.displayName} (${collection.url})`);
-					}
-					dropdown.setValue(account.collectionUrl).onChange((value) => {
-						account.collectionUrl = value;
-						this.save();
-					});
+			listSetting.setDesc("Choose which list this account syncs with.").addDropdown((dropdown) => {
+				for (const collection of discovered) {
+					dropdown.addOption(collection.url, `${collection.displayName} (${collection.url})`);
+				}
+				dropdown.setValue(account.collectionUrl).onChange((value) => {
+					account.collectionUrl = value;
+					this.save();
+					refreshHeader();
 				});
-		} else if (account.collectionUrl) {
-			new Setting(containerEl).setName("Selected task list").setDesc(account.collectionUrl);
+			});
+		} else {
+			listSetting.setDesc(
+				account.collectionUrl || "None selected yet. Use Discover below to find the lists this account can reach."
+			);
 		}
 
 		this.text(
-			containerEl,
+			body,
 			account,
 			"scopeTag",
 			"Only tasks with tag",
@@ -169,7 +170,7 @@ export class CalDavSettingTab extends PluginSettingTab {
 			"work"
 		);
 		this.text(
-			containerEl,
+			body,
 			account,
 			"scopeFolder",
 			"Only tasks in folder",
@@ -177,7 +178,7 @@ export class CalDavSettingTab extends PluginSettingTab {
 			"TaskNotes/Work"
 		);
 
-		new Setting(containerEl)
+		new Setting(body)
 			.setName("Check for changes every")
 			.setDesc("How often to look for changes on the server, in minutes.")
 			.addText((text) => {
@@ -190,7 +191,7 @@ export class CalDavSettingTab extends PluginSettingTab {
 				});
 			});
 
-		new Setting(containerEl)
+		new Setting(body)
 			.setName("When a task is deleted on the server")
 			.setDesc("What happens to the local note when its entry disappears from the server.")
 			.addDropdown((dropdown) =>
@@ -207,32 +208,61 @@ export class CalDavSettingTab extends PluginSettingTab {
 					})
 			);
 
-		new Setting(containerEl)
+		new Setting(body)
 			.setName("Sync this account")
-			.setDesc("Turn syncing on once the details above are correct.")
+			.setDesc("Turn syncing on once the details above are correct and the first sync is done.")
 			.addToggle((toggle) =>
 				toggle.setValue(account.enabled).onChange((value) => {
 					account.enabled = value;
 					this.save();
+					refreshHeader();
 				})
 			);
 
-		new Setting(containerEl)
-			.setName("First sync")
-			.setDesc("Compare this task list against your vault and show what would change before anything is written.")
-			.addButton((button) =>
-				button.setButtonText("Preview").onClick(() => void this.runFirstSyncPreview(account))
-			);
+		this.actionButton(actions, "search", "Discover task lists").onClick(
+			() => void this.discoverCollections(account)
+		);
+		this.actionButton(actions, "git-compare", "Preview first sync")
+			.setTooltip("Compare this task list against your vault before anything is written")
+			.setCta()
+			.onClick(() => void this.runFirstSyncPreview(account));
+		actions.createDiv({ cls: "tasknotes-caldav-account__spacer" });
+		this.actionButton(actions, "trash-2", "Remove")
+			.setTooltip("Stop syncing and forget this account's stored password")
+			.setWarning()
+			.onClick(() => void this.removeAccount(account));
+	}
 
-		new Setting(containerEl)
-			.setName("Remove account")
-			.setDesc("Stop syncing and forget this account's stored password.")
-			.addButton((button) =>
-				button
-					.setButtonText("Remove")
-					.setWarning()
-					.onClick(() => void this.removeAccount(account))
-			);
+	/** ButtonComponent.setIcon replaces the label, so icon and label get their own spans. */
+	private actionButton(parent: HTMLElement, icon: string, label: string): ButtonComponent {
+		const button = new ButtonComponent(parent);
+		setIcon(button.buttonEl.createSpan({ cls: "tasknotes-caldav-account__button-icon" }), icon);
+		button.buttonEl.createSpan({ text: label });
+		return button;
+	}
+
+	private renderAccountHeader(header: HTMLElement, account: CalDavAccountSettings): void {
+		header.empty();
+		const status = this.accountStatus(account);
+		header.createDiv({ cls: `tasknotes-caldav-account__dot is-${status.kind}` });
+		const info = header.createDiv({ cls: "tasknotes-caldav-account__info" });
+		info.createDiv({ cls: "tasknotes-caldav-account__title", text: account.name || "Unnamed account" });
+		info.createDiv({
+			cls: "tasknotes-caldav-account__subtitle",
+			text: account.collectionUrl || account.serverUrl || "CalDAV task list",
+		});
+		header.createSpan({ cls: `tasknotes-caldav-account__badge is-${status.kind}`, text: status.label });
+	}
+
+	private accountStatus(account: CalDavAccountSettings): {
+		kind: "syncing" | "paused" | "setup";
+		label: string;
+	} {
+		if (!this.secretStore.hasCredentials(account.id) || !account.collectionUrl) {
+			return { kind: "setup", label: "Setup incomplete" };
+		}
+		if (!account.enabled) return { kind: "paused", label: "Paused" };
+		return { kind: "syncing", label: "Syncing" };
 	}
 
 	private text(
@@ -241,7 +271,8 @@ export class CalDavSettingTab extends PluginSettingTab {
 		key: "name" | "serverUrl" | "username" | "scopeTag" | "scopeFolder",
 		name: string,
 		desc: string,
-		placeholder = ""
+		placeholder = "",
+		afterChange?: () => void
 	): void {
 		new Setting(containerEl)
 			.setName(name)
@@ -253,6 +284,7 @@ export class CalDavSettingTab extends PluginSettingTab {
 					.onChange((value) => {
 						account[key] = key === "name" ? value : value.trim();
 						this.save();
+						afterChange?.();
 					})
 			);
 	}

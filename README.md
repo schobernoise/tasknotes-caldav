@@ -19,7 +19,7 @@ The sync started life as a pull request to TaskNotes itself ([#2280](https://git
 The plugin is not in the community plugin directory (yet). Two ways to install it:
 
 - **BRAT**: add `schobernoise/tasknotes-caldav` in [BRAT](https://github.com/TfTHacker/obsidian42-brat).
-- **Manually**: download `main.js` and `manifest.json` from the [latest release](https://github.com/schobernoise/tasknotes-caldav/releases/latest) into `<vault>/.obsidian/plugins/tasknotes-caldav/`, then enable *TaskNotes CalDAV* under Settings → Community plugins.
+- **Manually**: download `main.js`, `manifest.json` and `styles.css` from the [latest release](https://github.com/schobernoise/tasknotes-caldav/releases/latest) into `<vault>/.obsidian/plugins/tasknotes-caldav/`, then enable *TaskNotes CalDAV* under Settings → Community plugins.
 
 ## Setup
 
@@ -104,7 +104,7 @@ npm version patch   # or minor / major: runs tests + build, bumps manifest.json 
 npm run release     # pushes main and the tag to origin, Codeberg and GitHub
 ```
 
-Pushing the tag triggers CI on GitHub and Codeberg, which builds the plugin and attaches `main.js` and `manifest.json` to a release. Tags carry no `v` prefix, because Obsidian looks releases up by the exact version in `manifest.json`.
+Pushing the tag triggers CI on GitHub and Codeberg, which builds the plugin and attaches `main.js`, `manifest.json` and `styles.css` to a release. Tags carry no `v` prefix, because Obsidian looks releases up by the exact version in `manifest.json`.
 
 ## Credits
 
