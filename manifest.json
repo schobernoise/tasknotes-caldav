@@ -1,7 +1,7 @@
 {
 	"id": "tasknotes-caldav",
 	"name": "TaskNotes CalDAV",
-	"version": "0.3.0",
+	"version": "0.3.1",
 	"minAppVersion": "1.11.4",
 	"description": "Two-way sync of TaskNotes tasks with a CalDAV task list (VTODO). Requires TaskNotes.",
 	"author": "Fabian Schober",
