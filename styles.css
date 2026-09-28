@@ -100,3 +100,45 @@
 .tasknotes-caldav-account__spacer {
 	flex: 1;
 }
+
+/* Tag filter: removable chips followed by an inline input. */
+
+.tasknotes-caldav-tags {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 6px;
+	margin-top: 8px;
+}
+
+.tasknotes-caldav-tags__chip {
+	display: inline-flex;
+	align-items: center;
+	gap: 2px;
+	padding: 2px 4px 2px 8px;
+	border-radius: var(--radius-l);
+	background: var(--tag-background);
+	color: var(--tag-color);
+	font-size: var(--font-ui-smaller);
+}
+
+.tasknotes-caldav-tags__remove {
+	display: flex;
+	cursor: var(--cursor-link, pointer);
+	opacity: 0.7;
+}
+
+.tasknotes-caldav-tags__remove:hover {
+	opacity: 1;
+}
+
+.tasknotes-caldav-tags__remove svg {
+	width: var(--icon-xs);
+	height: var(--icon-xs);
+}
+
+.tasknotes-caldav-tags__input {
+	flex: 1;
+	min-width: 10em;
+	font-size: var(--font-ui-smaller);
+}

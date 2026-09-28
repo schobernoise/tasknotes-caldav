@@ -102,6 +102,9 @@ export interface TaskNotesApi {
 		parents(path: string): Promise<TaskInfo[]>;
 		dependencies(path: string): Promise<ResolvedTaskDependency[]>;
 	};
+	readonly settings: {
+		snapshot(): { taskIdentificationMethod: string; taskTag: string };
+	};
 	readonly catalog: {
 		statuses(): StatusConfig[];
 		priorities(): PriorityConfig[];
@@ -126,6 +129,7 @@ const REQUIRED_CAPABILITIES = [
 	"tasks.delete",
 	"tasks.events",
 	"catalog.read",
+	"settings.snapshot",
 	"relationships.read",
 	"lifecycle.events",
 ];

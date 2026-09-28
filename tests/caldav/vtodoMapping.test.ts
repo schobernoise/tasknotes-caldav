@@ -3,6 +3,7 @@ import type { TaskInfo } from "../../src/tasknotes";
 import {
 	applyTaskToVTodo,
 	joinRecurrence,
+	mergeRemoteTags,
 	readVTodoIntoTaskPatch,
 	readVTodoRevision,
 	readVTodoUid,
@@ -187,6 +188,19 @@ describe("applyTaskToVTodo", () => {
 		expect(getProperty(doc, "CATEGORIES")?.value).toBe("errands,shopping");
 	});
 
+	it("leaves hidden tags out of CATEGORIES, matching case- and #-insensitively", () => {
+		const doc = createVTodoDocument();
+		const task = makeTask({ tags: ["notiz/task", "errands"] });
+		applyTaskToVTodo(doc, task, { ...context, hiddenTags: ["#Notiz/Task"] }, { uid: "uid-1" });
+		expect(getProperty(doc, "CATEGORIES")?.value).toBe("errands");
+	});
+
+	it("drops CATEGORIES entirely when only hidden tags remain", () => {
+		const doc = createVTodoDocument();
+		applyTaskToVTodo(doc, makeTask({ tags: ["task"] }), { ...context, hiddenTags: ["task"] }, { uid: "uid-1" });
+		expect(getProperty(doc, "CATEGORIES")).toBeUndefined();
+	});
+
 	it("writes COMPLETED and PERCENT-COMPLETE for a done task", () => {
 		const doc = createVTodoDocument();
 		const task = makeTask({ status: "done", completedDate: "2025-09-02" });
@@ -354,5 +368,28 @@ describe("readVTodoRevision", () => {
 
 	it("returns null when neither is present, so the caller can fall back", () => {
 		expect(readVTodoRevision(docWith([]))).toBeNull();
+	});
+});
+
+describe("mergeRemoteTags", () => {
+	it("takes the server's categories and keeps a protected tag the note had", () => {
+		expect(mergeRemoteTags(["errands"], ["task", "old"], ["task"])).toEqual(["errands", "task"]);
+	});
+
+	it("keeps the protected tag when a client dropped every category", () => {
+		// Otherwise a phone that strips categories would turn the note into a non-task.
+		expect(mergeRemoteTags([], ["task", "errands"], ["task"])).toEqual(["task"]);
+	});
+
+	it("does not duplicate a protected tag the server also sent", () => {
+		expect(mergeRemoteTags(["task", "errands"], ["task"], ["task"])).toEqual(["task", "errands"]);
+	});
+
+	it("does not invent a protected tag the note never had", () => {
+		expect(mergeRemoteTags(["errands"], ["old"], ["task"])).toEqual(["errands"]);
+	});
+
+	it("adds the protected tag to an import when passed as the local tags", () => {
+		expect(mergeRemoteTags(["errands"], ["task"], ["task"])).toEqual(["errands", "task"]);
 	});
 });

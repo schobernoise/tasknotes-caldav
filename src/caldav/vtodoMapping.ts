@@ -50,6 +50,8 @@ export interface VTodoMappingContext {
 	statusOverrides?: Record<string, VTodoStatus>;
 	/** Resolves a TZID wall time to UTC; see icsDateValue.ts. */
 	zoneToUtc?: ZoneToUtc;
+	/** Tags kept out of CATEGORIES, e.g. the tag TaskNotes identifies task notes by. */
+	hiddenTags?: readonly string[];
 }
 
 /** The subset of a task that a remote VTODO can dictate. */
@@ -277,7 +279,11 @@ export function applyTaskToVTodo(
 	if (priority === undefined) removeProperty(doc, "PRIORITY");
 	else setProperty(doc, "PRIORITY", String(priority));
 
-	setTextListProperty(doc, "CATEGORIES", task.tags ?? []);
+	setTextListProperty(
+		doc,
+		"CATEGORIES",
+		(task.tags ?? []).filter((tag) => !includesTag(context.hiddenTags ?? [], tag))
+	);
 
 	const stamp = isoToIcsUtcStamp(now);
 	if (stamp) {
@@ -382,6 +388,32 @@ function readDate(
 	if (!parsed) return undefined;
 
 	return icsDateValueToTaskDate(parsed, context.zoneToUtc) ?? undefined;
+}
+
+/**
+ * The tags a task should carry after a pull: the server's CATEGORIES plus any
+ * protected tag the note already had. A client that drops or never saw the
+ * TaskNotes task tag must not be able to strip it, or the note would stop
+ * being a task.
+ */
+export function mergeRemoteTags(
+	remoteTags: readonly string[],
+	localTags: readonly string[] | undefined,
+	protectedTags: readonly string[]
+): string[] {
+	const kept = (localTags ?? []).filter(
+		(tag) => includesTag(protectedTags, tag) && !includesTag(remoteTags, tag)
+	);
+	return [...remoteTags, ...kept];
+}
+
+function includesTag(tags: readonly string[], tag: string): boolean {
+	const wanted = normalizeTag(tag);
+	return tags.some((candidate) => normalizeTag(candidate) === wanted);
+}
+
+function normalizeTag(tag: string): string {
+	return tag.trim().replace(/^#/u, "").toLowerCase();
 }
 
 function findStatus(statuses: StatusConfig[], value: string): StatusConfig | undefined {

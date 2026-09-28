@@ -58,6 +58,19 @@ export class CalDavSettingTab extends PluginSettingTab {
 				})
 			);
 
+		const taskTag = this.plugin.sync?.taskTags()[0];
+		new Setting(containerEl)
+			.setName("Sync the task tag")
+			.setDesc(
+				`Send the tag TaskNotes uses to recognise task notes${taskTag ? ` (#${taskTag})` : ""} to the server. Every synced task carries it, so it is off by default. Your notes keep the tag either way.`
+			)
+			.addToggle((toggle) =>
+				toggle.setValue(this.settings.syncTaskTag).onChange((value) => {
+					this.settings.syncTaskTag = value;
+					this.save();
+				})
+			);
+
 		new Setting(containerEl)
 			.setName("Debug logging")
 			.setDesc("Log sync decisions to the developer console.")
@@ -161,14 +174,7 @@ export class CalDavSettingTab extends PluginSettingTab {
 			);
 		}
 
-		this.text(
-			body,
-			account,
-			"scopeTag",
-			"Only tasks with tag",
-			"Sync only tasks carrying this tag (nested tags included). Leave empty for no tag restriction.",
-			"work"
-		);
+		this.renderTagFilter(body, account);
 		this.text(
 			body,
 			account,
@@ -241,6 +247,55 @@ export class CalDavSettingTab extends PluginSettingTab {
 		return button;
 	}
 
+	private renderTagFilter(body: HTMLElement, account: CalDavAccountSettings): void {
+		const setting = new Setting(body)
+			.setName("Tag filter")
+			.setDesc("Nested tags count too: work also matches work/client. Leave the list empty to sync every task.")
+			.addDropdown((dropdown) =>
+				dropdown
+					.addOptions({
+						include: "Only tasks with these tags",
+						exclude: "All tasks except these tags",
+					})
+					.setValue(account.scopeTagMode)
+					.onChange((value) => {
+						account.scopeTagMode = value as CalDavAccountSettings["scopeTagMode"];
+						this.save();
+					})
+			);
+
+		const list = setting.descEl.createDiv({ cls: "tasknotes-caldav-tags" });
+		const render = () => {
+			list.empty();
+			for (const tag of account.scopeTags) {
+				const chip = list.createSpan({ cls: "tasknotes-caldav-tags__chip", text: `#${tag}` });
+				const remove = chip.createSpan({ cls: "tasknotes-caldav-tags__remove", attr: { "aria-label": `Remove #${tag}` } });
+				setIcon(remove, "x");
+				remove.onclick = () => {
+					account.scopeTags = account.scopeTags.filter((candidate) => candidate !== tag);
+					this.save();
+					render();
+				};
+			}
+			const input = list.createEl("input", {
+				cls: "tasknotes-caldav-tags__input",
+				attr: { type: "text", placeholder: "Add tag, press Enter" },
+			});
+			input.onkeydown = (event) => {
+				if (event.key !== "Enter") return;
+				const tag = input.value.trim().replace(/^#/u, "");
+				const known = account.scopeTags.some((existing) => existing.toLowerCase() === tag.toLowerCase());
+				if (tag && !known) {
+					account.scopeTags = [...account.scopeTags, tag];
+					this.save();
+				}
+				render();
+				list.querySelector<HTMLInputElement>(".tasknotes-caldav-tags__input")?.focus();
+			};
+		};
+		render();
+	}
+
 	private renderAccountHeader(header: HTMLElement, account: CalDavAccountSettings): void {
 		header.empty();
 		const status = this.accountStatus(account);
@@ -268,7 +323,7 @@ export class CalDavSettingTab extends PluginSettingTab {
 	private text(
 		containerEl: HTMLElement,
 		account: CalDavAccountSettings,
-		key: "name" | "serverUrl" | "username" | "scopeTag" | "scopeFolder",
+		key: "name" | "serverUrl" | "username" | "scopeFolder",
 		name: string,
 		desc: string,
 		placeholder = "",

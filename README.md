@@ -29,7 +29,7 @@ The plugin is not in the community plugin directory (yet). Two ways to install i
    - iCloud: `https://caldav.icloud.com` with an app-specific password
    - Credentials are only ever sent over `https://` (plain `http://` is allowed for `localhost`).
 3. Press **Discover** and pick the task list. Event-only calendars, read-only subscriptions and deleted lists are filtered out.
-4. Optionally restrict the account to a **tag** and/or a **folder**.
+4. Optionally narrow down what the account syncs: a **tag filter** (only tasks with any of the listed tags, or all tasks except those) and/or a **folder**.
 5. Press **Preview** under *First sync*. You get four numbers — to upload, to import, already matching, changed on both sides — and nothing is written until you confirm.
 6. Turn on **Sync this account**.
 
@@ -54,6 +54,8 @@ The note body is **not** synced. Anything the plugin doesn't model — a descrip
 
 **Statuses and priorities.** TaskNotes lets you define your own, CalDAV has a fixed set. A status marked *completed* becomes `COMPLETED`, one marked *skipped* becomes `CANCELLED`, everything else `NEEDS-ACTION`. Coming back, `NEEDS-ACTION` maps to your first open status by order. Priorities are spread across CalDAV's 1–9 scale by their weight.
 
+**The task tag.** TaskNotes recognises task notes by a tag (`#task` by default). Every synced task would carry it, so it's left off the server unless you turn on *Sync the task tag*. Your notes always keep it, even when a phone app edits or drops a task's categories.
+
 **Subtasks.** A subtask is a task whose *Projects* field links to another task, and it arrives on the server as a real subtask. A link is only sent once both tasks exist on the server; projects that are plain notes rather than tasks are left out.
 
 ## How it behaves
@@ -62,7 +64,7 @@ The note body is **not** synced. Anything the plugin doesn't model — a descrip
 - **Conflicts.** If both sides changed since the last sync, the server rejects the write (ETag mismatch) and the more recently changed side wins. This compares your computer's clock with the server's, so both should be roughly right.
 - **Deleting.** Deleting a note deletes the task on the server. When a task disappears from the server you choose per account: archive the note (default), keep it and stop syncing, or delete it.
 - **Archived tasks** are never uploaded.
-- **Scoping.** A task syncs to the first enabled account whose tag/folder scope it matches, so it's never uploaded twice.
+- **Scoping.** A task syncs to the first enabled account whose tag filter and folder it matches, so it's never uploaded twice. Nested tags count: a filter on `work` also matches `work/client`.
 - **Offline.** A push that fails is queued and retried every minute, up to five attempts.
 - **Unlinking** removes the `caldav_*` keys and deletes nothing on either side. The link is also what stops a task being uploaded twice, so syncing the same list again afterwards gives you a second copy of every task.
 

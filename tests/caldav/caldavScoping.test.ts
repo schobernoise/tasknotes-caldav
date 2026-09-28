@@ -108,18 +108,41 @@ describe("hasCalDavRelevantChange", () => {
 describe("taskBelongsToCollection", () => {
 	it("matches every task when the scope has no tag or folder", () => {
 		expect(taskBelongsToCollection(makeTask(), { accountId: "a" })).toBe(true);
-		expect(taskBelongsToCollection(makeTask(), { accountId: "a", tag: " ", folder: "" })).toBe(
+		expect(taskBelongsToCollection(makeTask(), { accountId: "a", tags: [" "], folder: "" })).toBe(
 			true
 		);
 	});
 
 	it("matches a tag with or without #, case-insensitively, including nested tags", () => {
-		const scope: CalDavCollectionScope = { accountId: "work", tag: "#Work" };
+		const scope: CalDavCollectionScope = { accountId: "work", tags: ["#Work"] };
 		expect(taskBelongsToCollection(makeTask({ tags: ["work"] }), scope)).toBe(true);
 		expect(taskBelongsToCollection(makeTask({ tags: ["#work/client"] }), scope)).toBe(true);
 		expect(taskBelongsToCollection(makeTask({ tags: ["workshop"] }), scope)).toBe(false);
 		expect(taskBelongsToCollection(makeTask({ tags: ["personal"] }), scope)).toBe(false);
 		expect(taskBelongsToCollection(makeTask(), scope)).toBe(false);
+	});
+
+	it("includes a task carrying any one of several tags", () => {
+		const scope: CalDavCollectionScope = { accountId: "a", tags: ["work", "errand"] };
+		expect(taskBelongsToCollection(makeTask({ tags: ["errand"] }), scope)).toBe(true);
+		expect(taskBelongsToCollection(makeTask({ tags: ["home"] }), scope)).toBe(false);
+	});
+
+	it("in exclude mode, skips tasks with any listed tag and keeps the rest", () => {
+		const scope: CalDavCollectionScope = {
+			accountId: "a",
+			tags: ["private", "someday"],
+			tagMode: "exclude",
+		};
+		expect(taskBelongsToCollection(makeTask({ tags: ["private/health"] }), scope)).toBe(false);
+		expect(taskBelongsToCollection(makeTask({ tags: ["work", "someday"] }), scope)).toBe(false);
+		expect(taskBelongsToCollection(makeTask({ tags: ["work"] }), scope)).toBe(true);
+		expect(taskBelongsToCollection(makeTask(), scope)).toBe(true);
+	});
+
+	it("in exclude mode with an empty list, restricts nothing", () => {
+		const scope: CalDavCollectionScope = { accountId: "a", tags: [], tagMode: "exclude" };
+		expect(taskBelongsToCollection(makeTask({ tags: ["private"] }), scope)).toBe(true);
 	});
 
 	it("matches a folder and its subfolders, not name-prefixed siblings", () => {
@@ -131,7 +154,7 @@ describe("taskBelongsToCollection", () => {
 	});
 
 	it("requires both tag and folder when both are set", () => {
-		const scope: CalDavCollectionScope = { accountId: "a", tag: "work", folder: "Tasks" };
+		const scope: CalDavCollectionScope = { accountId: "a", tags: ["work"], folder: "Tasks" };
 		expect(taskBelongsToCollection(makeTask({ tags: ["work"] }), scope)).toBe(true);
 		expect(
 			taskBelongsToCollection(makeTask({ tags: ["work"], path: "Other/a.md" }), scope)
@@ -150,8 +173,8 @@ describe("taskBelongsToCollection", () => {
 
 describe("resolveCollectionForTask", () => {
 	const scopes: CalDavCollectionScope[] = [
-		{ accountId: "work", tag: "work" },
-		{ accountId: "personal", tag: "personal" },
+		{ accountId: "work", tags: ["work"] },
+		{ accountId: "personal", tags: ["personal"] },
 		{ accountId: "catch-all" },
 	];
 

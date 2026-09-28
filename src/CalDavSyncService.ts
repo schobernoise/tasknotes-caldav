@@ -38,6 +38,7 @@ import {
 import { taskBelongsToCollection, type CalDavCollectionScope } from "./caldav/collectionMembership";
 import {
 	applyTaskToVTodo,
+	mergeRemoteTags,
 	readVTodoIntoTaskPatch,
 	readVTodoRevision,
 	readVTodoUid,
@@ -456,6 +457,8 @@ export class CalDavSyncService {
 		const path = knownPath ?? (await this.findPathForUid(account.id, uid));
 
 		if (path) {
+			const local = await this.api.tasks.get(path);
+			if (!local) return;
 			// A title change renames the note when TaskNotes stores titles in
 			// filenames, so everything after the update follows the returned path.
 			let currentPath = path;
@@ -470,7 +473,9 @@ export class CalDavSyncService {
 						due: patch.due ?? undefined,
 						scheduled: patch.scheduled ?? undefined,
 						completedDate: patch.completedDate ?? undefined,
-						...(patch.tags !== undefined && { tags: patch.tags }),
+						...(patch.tags !== undefined && {
+							tags: mergeRemoteTags(patch.tags, local.tags, this.taskTags()),
+						}),
 						recurrence: patch.recurrence ?? undefined,
 					},
 					CONTEXT
@@ -495,6 +500,7 @@ export class CalDavSyncService {
 
 		// New on the server: create through TaskNotes so folder rules, templates
 		// and defaults all apply.
+		const tags = mergeRemoteTags(patch.tags ?? [], this.taskTags(), this.taskTags());
 		const created = await this.api.tasks.create(
 			{
 				title: patch.title ?? "Untitled task",
@@ -509,7 +515,7 @@ export class CalDavSyncService {
 				scheduled: patch.scheduled ?? "",
 				completedDate: patch.completedDate ?? "",
 				recurrence: patch.recurrence ?? "",
-				...(patch.tags?.length ? { tags: patch.tags } : {}),
+				...(tags.length ? { tags } : {}),
 				creationContext: "import",
 				// The CalDAV keys are not TaskNotes fields, so they travel as
 				// custom frontmatter and land in the file in the same write.
@@ -999,7 +1005,14 @@ export class CalDavSyncService {
 			statuses: this.api.catalog.statuses(),
 			priorities: this.api.catalog.priorities(),
 			statusOverrides: account.statusOverrides,
+			hiddenTags: this.settings.syncTaskTag ? [] : this.taskTags(),
 		};
+	}
+
+	/** The tag TaskNotes recognises task notes by, when it identifies them by tag. */
+	taskTags(): string[] {
+		const { taskIdentificationMethod, taskTag } = this.api.settings.snapshot();
+		return taskIdentificationMethod === "tag" && taskTag ? [taskTag] : [];
 	}
 
 	// -----------------------------------------------------------------------
@@ -1173,7 +1186,12 @@ function toRemoteSnapshot(
 }
 
 function scopeFor(account: CalDavAccountSettings): CalDavCollectionScope {
-	return { accountId: account.id, tag: account.scopeTag, folder: account.scopeFolder };
+	return {
+		accountId: account.id,
+		tags: account.scopeTags,
+		tagMode: account.scopeTagMode,
+		folder: account.scopeFolder,
+	};
 }
 
 /**

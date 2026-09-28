@@ -23,8 +23,10 @@ export interface CalDavAccountSettings {
 	collectionUrl: string; // The chosen VTODO collection
 	username: string; // Non-secret half of the credentials
 	syncIntervalMinutes: number;
-	/** Only tasks carrying this tag sync; empty means no tag restriction. */
-	scopeTag: string;
+	/** Tag filter; empty means no tag restriction. */
+	scopeTags: string[];
+	/** `include`: sync only tasks with one of `scopeTags`. `exclude`: sync all tasks without them. */
+	scopeTagMode: "include" | "exclude";
 	/** Only tasks inside this folder sync; empty means no folder restriction. */
 	scopeFolder: string;
 	/** Overrides the status mapping auto-derived from StatusConfig flags. */
@@ -40,6 +42,8 @@ export interface CalDavSettings {
 	pushOnChange: boolean;
 	/** Debounce before an edit is pushed, so a burst of keystrokes is one write. */
 	pushDebounceMs: number;
+	/** Send TaskNotes' task-identification tag as a CATEGORY. It is kept on notes either way. */
+	syncTaskTag: boolean;
 	debugLogging: boolean;
 }
 
@@ -47,6 +51,7 @@ export const DEFAULT_SETTINGS: CalDavSettings = {
 	accounts: [],
 	pushOnChange: true,
 	pushDebounceMs: 1500,
+	syncTaskTag: false, // Every synced task has it, so on the server it is noise
 	debugLogging: false,
 };
 
@@ -57,7 +62,8 @@ export const DEFAULT_ACCOUNT: Omit<CalDavAccountSettings, "id"> = {
 	collectionUrl: "",
 	username: "",
 	syncIntervalMinutes: 15,
-	scopeTag: "",
+	scopeTags: [],
+	scopeTagMode: "include",
 	scopeFolder: "",
 	statusOverrides: {},
 	remoteDeletionPolicy: "archive", // Never destroy notes without being asked
@@ -69,6 +75,14 @@ export function mergeSettings(loaded: Partial<CalDavSettings> | undefined): CalD
 	return {
 		...DEFAULT_SETTINGS,
 		...loaded,
-		accounts: (loaded?.accounts ?? []).map((account) => ({ ...DEFAULT_ACCOUNT, ...account })),
+		accounts: (loaded?.accounts ?? []).map(migrateAccount),
 	};
+}
+
+/** 0.2.0 stored a single `scopeTag`; it becomes a one-entry include list. */
+function migrateAccount(saved: Partial<CalDavAccountSettings> & { scopeTag?: string }): CalDavAccountSettings {
+	const { scopeTag, ...account } = saved;
+	const merged = { ...DEFAULT_ACCOUNT, ...account } as CalDavAccountSettings;
+	if (scopeTag?.trim() && !saved.scopeTags) merged.scopeTags = [scopeTag.trim()];
+	return merged;
 }

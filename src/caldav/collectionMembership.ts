@@ -1,8 +1,9 @@
 /**
  * Decides which CalDAV collection a task belongs to.
  *
- * Each account can be scoped by a tag, a folder, or both (both must match).
- * An account with neither takes every task.
+ * Each account can be scoped by a tag list (include: any of them; exclude:
+ * none of them), a folder, or both (both must hold). An account with neither
+ * takes every task.
  *
  * Pure: no Obsidian runtime, no network, no DOM or timer globals.
  */
@@ -12,8 +13,10 @@ import type { TaskInfo } from "../tasknotes";
 export interface CalDavCollectionScope {
 	/** Stable id of the configured account/collection. */
 	accountId: string;
-	/** Tag without the leading `#`; nested tags (`work/client`) also match `work`. */
-	tag?: string;
+	/** Tags with or without `#`; nested tags (`work/client`) also match `work`. */
+	tags?: readonly string[];
+	/** `include`: the task needs one of `tags`. `exclude`: it must have none. */
+	tagMode?: "include" | "exclude";
 	/** Vault folder; tasks in subfolders match too. */
 	folder?: string;
 }
@@ -22,7 +25,7 @@ export function taskBelongsToCollection(task: TaskInfo, scope: CalDavCollectionS
 	// Archived tasks are never pushed; archiving is how a remote deletion is
 	// reflected locally, so re-uploading them would resurrect deleted VTODOs.
 	if (task.archived) return false;
-	return matchesTag(task, scope.tag) && matchesFolder(task, scope.folder);
+	return matchesTags(task, scope.tags, scope.tagMode ?? "include") && matchesFolder(task, scope.folder);
 }
 
 /**
@@ -38,13 +41,18 @@ export function resolveCollectionForTask(
 	return scopes.find((scope) => taskBelongsToCollection(task, scope));
 }
 
-function matchesTag(task: TaskInfo, tag: string | undefined): boolean {
-	const wanted = normalizeTag(tag);
-	if (!wanted) return true;
-	return (task.tags ?? []).some((candidate) => {
+function matchesTags(
+	task: TaskInfo,
+	tags: readonly string[] | undefined,
+	mode: "include" | "exclude"
+): boolean {
+	const wanted = (tags ?? []).map(normalizeTag).filter(Boolean);
+	if (wanted.length === 0) return true;
+	const hasAny = (task.tags ?? []).some((candidate) => {
 		const have = normalizeTag(candidate);
-		return have === wanted || have.startsWith(`${wanted}/`);
+		return wanted.some((tag) => have === tag || have.startsWith(`${tag}/`));
 	});
+	return mode === "include" ? hasAny : !hasAny;
 }
 
 function matchesFolder(task: TaskInfo, folder: string | undefined): boolean {
