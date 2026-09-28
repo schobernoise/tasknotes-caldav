@@ -63,6 +63,8 @@ The note body is **not** synced. Anything the plugin doesn't model — a descrip
 - **Timing.** Local edits are pushed about 1.5 seconds after you stop typing, whether you edit through TaskNotes or type straight into the frontmatter. Server changes are polled per account (every 15 minutes by default), and a poll that finds the list unchanged stops after a single request.
 - **Conflicts.** If both sides changed since the last sync, the server rejects the write (ETag mismatch) and the more recently changed side wins. This compares your computer's clock with the server's, so both should be roughly right.
 - **Deleting.** Deleting a note deletes the task on the server. When a task disappears from the server you choose per account: archive the note (default), keep it and stop syncing, or delete it.
+- **Dates the server can't take as-is.** CalDAV requires start and due to be the same kind (both dates or both date-times) and due not to come before start; TaskNotes allows both. On the server, a plain date next to a timed one gets a time (start 00:00, due 23:59), and a start after the due date is left out. Your notes keep their own values, and a sync only writes a field back into a note when the server actually changed it.
+- **One bad task doesn't block the rest.** A task the server rejects is skipped, the rest of the sync carries on, and a notice names the task and the server's reason. It's retried on the next sync.
 - **Archived tasks** are never uploaded.
 - **Scoping.** A task syncs to the first enabled account whose tag filter and folder it matches, so it's never uploaded twice. Nested tags count: a filter on `work` also matches `work/client`.
 - **Offline.** A push that fails is queued and retried every minute, up to five attempts.

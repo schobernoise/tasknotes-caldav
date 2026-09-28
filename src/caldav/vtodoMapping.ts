@@ -15,6 +15,7 @@
 
 import type { PriorityConfig, StatusConfig, TaskInfo } from "../tasknotes";
 import {
+	type IcsDateValue,
 	formatIcsDateValue,
 	icsDateValueToTaskDate,
 	icsStampToEpochMs,
@@ -230,23 +231,20 @@ export function applyTaskToVTodo(
 	setTextProperty(doc, "UID", options.uid);
 	setTextProperty(doc, "SUMMARY", task.title ?? "");
 
-	writeDate(doc, "DUE", task.due);
-
 	const recurrence = task.recurrence ? splitRecurrence(task.recurrence) : undefined;
 	// DTSTART doubles as the recurrence anchor, so a recurring task falls back to
 	// the rule's own anchor when it has no scheduled date of its own.
-	const scheduled = task.scheduled
-		? taskDateToIcsDateValue(task.scheduled)
-		: recurrence?.dtstart
-			? parseIcsDateValue(recurrence.dtstart)
-			: null;
-
-	if (scheduled) {
-		const { value, params } = formatIcsDateValue(scheduled);
-		setProperty(doc, "DTSTART", value, params);
-	} else {
-		removeProperty(doc, "DTSTART");
-	}
+	const { start, due } = reconcileStartAndDue(
+		task.scheduled
+			? taskDateToIcsDateValue(task.scheduled)
+			: recurrence?.dtstart
+				? parseIcsDateValue(recurrence.dtstart)
+				: null,
+		task.due ? taskDateToIcsDateValue(task.due) : null,
+		Boolean(recurrence?.rule)
+	);
+	writeDate(doc, "DTSTART", start);
+	writeDate(doc, "DUE", due);
 
 	if (recurrence?.rule) {
 		setProperty(doc, "RRULE", recurrence.rule);
@@ -293,14 +291,49 @@ export function applyTaskToVTodo(
 	bumpSequence(doc);
 }
 
-function writeDate(doc: VTodoDocument, name: string, taskDate: string | undefined): void {
-	const parsed = taskDate ? taskDateToIcsDateValue(taskDate) : null;
-	if (!parsed) {
+function writeDate(doc: VTodoDocument, name: string, date: IcsDateValue | null): void {
+	if (!date) {
 		removeProperty(doc, name);
 		return;
 	}
-	const { value, params } = formatIcsDateValue(parsed);
+	const { value, params } = formatIcsDateValue(date);
 	setProperty(doc, name, value, params);
+}
+
+/**
+ * Makes a task's start/due pair valid for a VTODO.
+ *
+ * RFC 5545 §3.6.2 requires DUE and DTSTART to share a value type and DUE not to
+ * precede DTSTART; TaskNotes allows both, and servers such as Nextcloud reject
+ * the resource outright (415). A mixed pair gets its date-only side promoted:
+ * the start to the beginning of its day, the due date to the end of its day,
+ * so no information is lost. An inverted pair drops the start, unless a
+ * recurrence rule needs it as its anchor, in which case the due date goes.
+ * Pulls leave the note alone as long as the server keeps these values; see
+ * changedFields.
+ */
+export function reconcileStartAndDue(
+	start: IcsDateValue | null,
+	due: IcsDateValue | null,
+	hasRecurrenceRule: boolean
+): { start: IcsDateValue | null; due: IcsDateValue | null } {
+	if (!start || !due) return { start, due };
+
+	if (start.dateOnly !== due.dateOnly) {
+		if (start.dateOnly) start = taskDateToIcsDateValue(`${start.value}T00:00`);
+		else due = taskDateToIcsDateValue(`${due.value}T23:59`);
+	}
+
+	if (start && due && isBefore(due, start)) {
+		return hasRecurrenceRule ? { start, due: null } : { start: null, due };
+	}
+	return { start, due };
+}
+
+/** Values compare as strings only in the same form: both dates, or both UTC. */
+function isBefore(a: IcsDateValue, b: IcsDateValue): boolean {
+	const sameForm = a.dateOnly ? b.dateOnly : a.utc && b.utc;
+	return sameForm && a.value < b.value;
 }
 
 function bumpSequence(doc: VTodoDocument): void {
@@ -388,6 +421,31 @@ function readDate(
 	if (!parsed) return undefined;
 
 	return icsDateValueToTaskDate(parsed, context.zoneToUtc) ?? undefined;
+}
+
+/**
+ * The fields of a pulled VTODO that the server actually changed.
+ *
+ * `own` is what reading back the plugin's own encoding of the local task gives.
+ * Where the server's value equals it, the server kept what it was sent, and
+ * the note keeps its own value: otherwise lossy encodings would leak back into
+ * it on every pull (a date promoted to a time for RFC 5545, an in-progress
+ * status sent as NEEDS-ACTION, a priority rounded onto the 1-9 scale).
+ */
+export function changedFields(remote: VTodoTaskPatch, own: VTodoTaskPatch): VTodoTaskPatch {
+	const changed: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(remote)) {
+		if (comparableValue(value) !== comparableValue(own[key as keyof VTodoTaskPatch])) {
+			changed[key] = value;
+		}
+	}
+	return changed as VTodoTaskPatch;
+}
+
+function comparableValue(value: unknown): string {
+	if (value === undefined || value === null || value === "") return "";
+	if (Array.isArray(value)) return JSON.stringify(value.map((item) => String(item).toLowerCase()).sort());
+	return JSON.stringify(value);
 }
 
 /**

@@ -10,6 +10,7 @@ import { App, ButtonComponent, Modal, Notice, PluginSettingTab, Setting, setIcon
 import type CalDavPlugin from "./main";
 import { CalDavClient, CalDavError, type CalDavCollectionInfo } from "./caldav/CalDavClient";
 import { CalDavSecretStore } from "./caldav/CalDavSecretStore";
+import { noticeFailures } from "./CalDavSyncService";
 import { summarizeFirstSyncPlan } from "./caldav/caldavReconciliation";
 import { createLogger } from "./log";
 import { DEFAULT_ACCOUNT, type CalDavAccountSettings, type CalDavRemoteDeletionPolicy } from "./settings";
@@ -400,10 +401,11 @@ export class CalDavSettingTab extends PluginSettingTab {
 			});
 			if (!confirmed) return;
 
-			await this.plugin.sync.applyFirstSync(account.id, plan);
+			const failures = await this.plugin.sync.applyFirstSync(account.id, plan);
 			account.initialSyncCompleted = true;
 			this.save();
-			new Notice("First sync finished.");
+			if (failures.length > 0) noticeFailures(failures);
+			else new Notice("First sync finished.");
 		} catch (error) {
 			this.reportError(error);
 		}

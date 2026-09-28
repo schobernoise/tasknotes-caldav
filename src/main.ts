@@ -1,6 +1,11 @@
 import { Notice, Plugin } from "obsidian";
 
-import { CalDavSyncService, EMPTY_SYNC_STATE, type SyncState } from "./CalDavSyncService";
+import {
+	CalDavSyncService,
+	EMPTY_SYNC_STATE,
+	noticeFailures,
+	type SyncState,
+} from "./CalDavSyncService";
 import { createLogger, logConfig } from "./log";
 import { mergeSettings, type CalDavSettings } from "./settings";
 import { CalDavSettingTab, confirm } from "./SettingsTab";
@@ -110,12 +115,9 @@ export default class CalDavPlugin extends Plugin {
 			this.notify("CalDAV sync is not running. Check that TaskNotes is enabled.");
 			return;
 		}
-		const { synced, failed } = await this.sync.syncAllAccounts();
-		this.notify(
-			failed === 0
-				? `CalDAV sync finished (${synced} account(s)).`
-				: `CalDAV sync failed for ${failed} of ${synced + failed} account(s). See the developer console.`
-		);
+		const { accounts, failures } = await this.sync.syncAllAccounts();
+		if (failures.length > 0) noticeFailures(failures);
+		else this.notify(`CalDAV sync finished (${accounts} account(s)).`);
 	}
 
 	private async unlinkAll(): Promise<void> {

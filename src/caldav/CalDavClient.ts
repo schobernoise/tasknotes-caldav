@@ -505,15 +505,16 @@ export class CalDavClient {
 	): CalDavError {
 		const kind = classifyStatus(response.status);
 		// Never log the URL's credentials or the request body; a 401 body from
-		// some servers echoes the submitted username.
+		// some servers echoes the submitted username, so its reason is skipped.
+		const reason = kind === "auth" ? undefined : serverReason(response);
 		this.logger.warn("CalDAV request failed", {
 			category: "provider",
 			operation: "request",
-			details: { status: response.status, method, path: pathOf(url), kind },
+			details: { status: response.status, method, path: pathOf(url), kind, reason },
 		});
 		return new CalDavError(
 			kind,
-			`CalDAV ${method} failed with status ${response.status}`,
+			`CalDAV ${method} failed with status ${response.status}${reason ? `: ${reason}` : ""}`,
 			response.status
 		);
 	}
@@ -554,6 +555,22 @@ function isSyncCollectionUnsupported(error: CalDavError): boolean {
  * Refuses to send credentials in the clear. Loopback is exempt so a local
  * Radicale instance can be used for development without a certificate.
  */
+/**
+ * The server's own explanation of an error, when it gives one in the
+ * DAV:error body — Sabre (Nextcloud, Baikal) uses <s:message>, e.g.
+ * "The value type (DATE or DATE-TIME) must be identical for DUE and DTSTART".
+ */
+export function serverReason(response: Pick<RequestUrlResponse, "text">): string | undefined {
+	let text: string;
+	try {
+		text = response.text;
+	} catch {
+		return undefined; // not a text body
+	}
+	const message = /<(?:[\w-]+:)?message>([^<]{1,300})<\//u.exec(text ?? "")?.[1]?.trim();
+	return message || undefined;
+}
+
 export function assertCredentialsAreSafeToSend(serverUrl: string): void {
 	let parsed: URL;
 	try {

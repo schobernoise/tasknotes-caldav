@@ -2,6 +2,7 @@ import type { RequestUrlParam, RequestUrlResponse } from "obsidian";
 import {
 	assertCredentialsAreSafeToSend,
 	basicAuthHeader,
+	serverReason,
 	CalDavClient,
 	CalDavError,
 	type CalDavRequestFn,
@@ -457,5 +458,20 @@ describe("discoverCollections", () => {
 
 		expect(calls[1].url).toBe("https://cloud.example.com/.well-known/caldav");
 		expect(collections).toHaveLength(1);
+	});
+});
+
+describe("serverReason", () => {
+	it("extracts Sabre's <s:message> from a DAV:error body", () => {
+		const text =
+			'<?xml version="1.0"?><d:error xmlns:d="DAV:" xmlns:s="http://sabredav.org/ns">' +
+			"<s:exception>Sabre\\DAV\\Exception\\UnsupportedMediaType</s:exception>" +
+			"<s:message>Validation error in iCalendar: DUE must occur after DTSTART</s:message></d:error>";
+		expect(serverReason({ text })).toBe("Validation error in iCalendar: DUE must occur after DTSTART");
+	});
+
+	it("returns undefined for bodies without a message", () => {
+		expect(serverReason({ text: "Internal Server Error" })).toBeUndefined();
+		expect(serverReason({ text: "" })).toBeUndefined();
 	});
 });

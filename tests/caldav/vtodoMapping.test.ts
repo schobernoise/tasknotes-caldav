@@ -2,8 +2,10 @@ import { DEFAULT_PRIORITIES, DEFAULT_STATUSES } from "../fixtures";
 import type { TaskInfo } from "../../src/tasknotes";
 import {
 	applyTaskToVTodo,
+	changedFields,
 	joinRecurrence,
 	mergeRemoteTags,
+	reconcileStartAndDue,
 	readVTodoIntoTaskPatch,
 	readVTodoRevision,
 	readVTodoUid,
@@ -18,6 +20,7 @@ import {
 	createVTodoDocument,
 	getProperty,
 	getTextProperty,
+	setTextProperty,
 	parseVTodoDocument,
 	serializeVTodoDocument,
 } from "../../src/caldav/vtodoDocument";
@@ -391,5 +394,103 @@ describe("mergeRemoteTags", () => {
 
 	it("adds the protected tag to an import when passed as the local tags", () => {
 		expect(mergeRemoteTags(["errands"], ["task"], ["task"])).toEqual(["errands", "task"]);
+	});
+});
+
+describe("reconcileStartAndDue (RFC 5545: same value type, DUE not before DTSTART)", () => {
+	const date = (value: string) => ({ dateOnly: true, value, utc: false });
+	const utc = (value: string) => ({ dateOnly: false, value, utc: true });
+
+	it("promotes a date-only start to the beginning of its day when due has a time", () => {
+		expect(reconcileStartAndDue(date("2026-03-25"), utc("2026-03-25T23:59:00"), false)).toEqual({
+			start: utc("2026-03-25T00:00:00"),
+			due: utc("2026-03-25T23:59:00"),
+		});
+	});
+
+	it("promotes a date-only due to the end of its day when start has a time", () => {
+		expect(reconcileStartAndDue(utc("2026-03-13T10:30:00"), date("2026-03-16"), false)).toEqual({
+			start: utc("2026-03-13T10:30:00"),
+			due: utc("2026-03-16T23:59:00"),
+		});
+	});
+
+	it("drops the start when due comes before it", () => {
+		expect(reconcileStartAndDue(date("2026-05-11"), date("2026-05-08"), false)).toEqual({
+			start: null,
+			due: date("2026-05-08"),
+		});
+	});
+
+	it("keeps the start and drops due instead when a recurrence rule needs the anchor", () => {
+		expect(reconcileStartAndDue(date("2026-05-11"), date("2026-05-08"), true)).toEqual({
+			start: date("2026-05-11"),
+			due: null,
+		});
+	});
+
+	it("leaves valid and single-sided pairs alone", () => {
+		expect(reconcileStartAndDue(date("2026-05-08"), date("2026-05-08"), false)).toEqual({
+			start: date("2026-05-08"),
+			due: date("2026-05-08"),
+		});
+		expect(reconcileStartAndDue(null, utc("2026-05-08T10:00:00"), false)).toEqual({
+			start: null,
+			due: utc("2026-05-08T10:00:00"),
+		});
+	});
+
+	it("is applied by applyTaskToVTodo, so the VTODO carries matching types", () => {
+		const doc = createVTodoDocument();
+		applyTaskToVTodo(doc, makeTask({ scheduled: "2026-03-25", due: "2026-03-25T23:59" }), context, {
+			uid: "uid-1",
+		});
+		expect(getProperty(doc, "DTSTART")).toMatchObject({ value: "20260325T000000Z" });
+		expect(getProperty(doc, "DUE")).toMatchObject({ value: "20260325T235900Z" });
+	});
+});
+
+describe("changedFields", () => {
+	it("drops fields equal to the plugin's own encoding and keeps real changes", () => {
+		expect(
+			changedFields(
+				{ title: "New", status: "open", due: null, tags: ["B", "a"] },
+				{ title: "Old", status: "open", tags: ["a", "b"] }
+			)
+		).toEqual({ title: "New" });
+	});
+
+	it("treats a cleared value as a change when the note had one", () => {
+		expect(changedFields({ due: null }, { due: "2026-05-08" })).toEqual({ due: null });
+	});
+});
+
+describe("pull round trip", () => {
+	const local = makeTask({
+		status: "in-progress",
+		priority: "normal",
+		scheduled: "2026-03-25",
+		due: "2026-03-25T23:59",
+		tags: ["errands"],
+	});
+	const encode = () => {
+		const doc = createVTodoDocument();
+		applyTaskToVTodo(doc, local, context, { uid: "uid-1" });
+		return doc;
+	};
+	const own = readVTodoIntoTaskPatch(encode(), context);
+
+	it("changes nothing when the server kept what it was sent", () => {
+		// Without this, the promoted 00:00 start and the in-progress status (sent
+		// as NEEDS-ACTION) would both be rewritten into the note on every pull.
+		expect(changedFields(readVTodoIntoTaskPatch(encode(), context), own)).toEqual({});
+	});
+
+	it("applies only what the server changed", () => {
+		const remote = encode();
+		setTextProperty(remote, "SUMMARY", "Edited on the phone");
+		expect(changedFields(readVTodoIntoTaskPatch(remote, context), own)).toEqual({
+			title: "Edited on the phone",
+		});
 	});
 });

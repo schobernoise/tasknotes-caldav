@@ -11,7 +11,7 @@
  * excludes every `caldav_*` key is what stops the cycle. See caldavFingerprint.ts.
  */
 
-import { TFile } from "obsidian";
+import { Notice, TFile } from "obsidian";
 
 import type CalDavPlugin from "./main";
 import type { CalDavAccountSettings } from "./settings";
@@ -38,11 +38,13 @@ import {
 import { taskBelongsToCollection, type CalDavCollectionScope } from "./caldav/collectionMembership";
 import {
 	applyTaskToVTodo,
+	changedFields,
 	mergeRemoteTags,
 	readVTodoIntoTaskPatch,
 	readVTodoRevision,
 	readVTodoUid,
 	type VTodoMappingContext,
+	type VTodoTaskPatch,
 } from "./caldav/vtodoMapping";
 import {
 	createVTodoDocument,
@@ -74,6 +76,19 @@ interface CalDavCollectionState {
 	/** Last seen collection ctag; equal means nothing changed server-side. */
 	ctag?: string;
 	lastSyncedAt?: string;
+}
+
+/** One task (or a whole account, for connection errors) that a sync run could not handle. */
+export interface SyncFailure {
+	path: string;
+	message: string;
+}
+
+/** Shows a sticky notice summarising failures; the full list is in the developer console. */
+export function noticeFailures(failures: readonly SyncFailure[]): void {
+	const [first] = failures;
+	const more = failures.length > 1 ? ` See the developer console for all ${failures.length}.` : "";
+	new Notice(`CalDAV: ${failures.length} task(s) could not be synced. ${first.path}: ${first.message}.${more}`, 0);
 }
 
 interface CalDavResourceIndexEntry {
@@ -374,12 +389,16 @@ export class CalDavSyncService {
 	// Pull (remote -> local)
 	// -----------------------------------------------------------------------
 
-	/** One polling pass for a single account. Resolves false if it failed (already logged). */
-	async syncAccount(accountId: string, options: { force?: boolean } = {}): Promise<boolean> {
+	/**
+	 * One polling pass for a single account. Resolves with what failed, already
+	 * logged; a task that fails is skipped so it cannot block the rest.
+	 */
+	async syncAccount(accountId: string, options: { force?: boolean } = {}): Promise<SyncFailure[]> {
 		const force = options.force ?? false;
 		const account = this.getAccount(accountId);
-		if (!account?.enabled || this.destroyed) return true;
-		if (this.inFlightAccounts.has(accountId)) return true;
+		if (!account?.enabled || this.destroyed) return [];
+		if (this.inFlightAccounts.has(accountId)) return [];
+		const failures: SyncFailure[] = [];
 
 		this.inFlightAccounts.add(accountId);
 		try {
@@ -392,7 +411,7 @@ export class CalDavSyncService {
 			// event body just to discover none of them are tasks.
 			const tag = await client.getCollectionTag(account.collectionUrl);
 			const currentTag = tag.ctag ?? tag.syncToken;
-			if (currentTag && state.ctag === currentTag && !force) return true;
+			if (currentTag && state.ctag === currentTag && !force) return [];
 
 			// A VTODO-filtered calendar-query returns only tasks, and returns all
 			// of them — completeness is what makes deletion detection safe.
@@ -402,38 +421,48 @@ export class CalDavSyncService {
 
 			for (const remote of plan.toPull) {
 				const withData = remotes.find((entry) => entry.uid === remote.uid);
-				if (withData) await this.applyRemotePatch(account, undefined, withData);
-			}
-
-			for (const conflict of plan.conflicts) {
-				if (conflict.winner === "local") {
-					await this.pushTask(accountId, conflict.local.path);
-				} else {
-					const withData = remotes.find((entry) => entry.uid === conflict.remote.uid);
-					if (withData) await this.applyRemotePatch(account, conflict.local.path, withData);
+				if (withData) {
+					await this.isolate(failures, `server task ${remote.uid}`, () =>
+						this.applyRemotePatch(account, undefined, withData)
+					);
 				}
 			}
 
+			for (const conflict of plan.conflicts) {
+				await this.isolate(failures, conflict.local.path, async () => {
+					if (conflict.winner === "local") {
+						await this.pushTask(accountId, conflict.local.path);
+						return;
+					}
+					const withData = remotes.find((entry) => entry.uid === conflict.remote.uid);
+					if (withData) await this.applyRemotePatch(account, conflict.local.path, withData);
+				});
+			}
+
 			for (const local of plan.remoteDeleted) {
-				await this.applyRemoteDeletion(account, local.path);
+				await this.isolate(failures, local.path, () => this.applyRemoteDeletion(account, local.path));
 			}
 
 			for (const local of plan.toPush) {
-				await this.pushTask(accountId, local.path);
+				await this.isolate(failures, local.path, () => this.pushTask(accountId, local.path));
 			}
 
 			await this.flushRelations(account);
 
-			this.state.collectionState[accountId] = {
-				syncToken: tag.syncToken ?? state.syncToken,
-				ctag: currentTag,
-				lastSyncedAt: new Date().toISOString(),
-			};
-			await this.plugin.saveState();
-			return true;
+			// Only a clean run moves the bookmark; otherwise the next poll would see
+			// an unchanged collection and never retry what failed.
+			if (failures.length === 0) {
+				this.state.collectionState[accountId] = {
+					syncToken: tag.syncToken ?? state.syncToken,
+					ctag: currentTag,
+					lastSyncedAt: new Date().toISOString(),
+				};
+				await this.plugin.saveState();
+			}
+			return failures;
 		} catch (error) {
 			this.reportSyncError(account, error);
-			return false;
+			return [...failures, { path: account.name || account.id, message: describeError(error) }];
 		} finally {
 			this.inFlightAccounts.delete(accountId);
 		}
@@ -453,33 +482,29 @@ export class CalDavSyncService {
 		if (!doc) return;
 
 		const uid = readVTodoUid(doc) ?? remote.uid;
-		const patch = readVTodoIntoTaskPatch(doc, this.mappingContext(account));
+		const context = this.mappingContext(account);
+		const patch = readVTodoIntoTaskPatch(doc, context);
 		const path = knownPath ?? (await this.findPathForUid(account.id, uid));
 
 		if (path) {
 			const local = await this.api.tasks.get(path);
 			if (!local) return;
+			const ownEncoding = createVTodoDocument();
+			applyTaskToVTodo(ownEncoding, local, context, { uid });
+			const updates = toTaskUpdate(
+				changedFields(patch, readVTodoIntoTaskPatch(ownEncoding, context)),
+				local,
+				this.taskTags()
+			);
 			// A title change renames the note when TaskNotes stores titles in
 			// filenames, so everything after the update follows the returned path.
 			let currentPath = path;
 			this.handlingPaths.add(path);
 			try {
-				const updated = await this.api.tasks.update(
-					path,
-					{
-						...(patch.title !== undefined && { title: patch.title }),
-						...(patch.status !== undefined && { status: patch.status }),
-						...(patch.priority !== undefined && { priority: patch.priority }),
-						due: patch.due ?? undefined,
-						scheduled: patch.scheduled ?? undefined,
-						completedDate: patch.completedDate ?? undefined,
-						...(patch.tags !== undefined && {
-							tags: mergeRemoteTags(patch.tags, local.tags, this.taskTags()),
-						}),
-						recurrence: patch.recurrence ?? undefined,
-					},
-					CONTEXT
-				);
+				const updated =
+					Object.keys(updates).length > 0
+						? await this.api.tasks.update(path, updates, CONTEXT)
+						: local;
 				currentPath = updated.path;
 				this.handlingPaths.add(currentPath);
 				await this.stampSyncMetadata(currentPath, {
@@ -547,13 +572,27 @@ export class CalDavSyncService {
 	 * Forced because the point of asking is usually to check a suspicion that
 	 * the tokens are lying.
 	 */
-	async syncAllAccounts(): Promise<{ synced: number; failed: number }> {
-		const result = { synced: 0, failed: 0 };
-		for (const account of this.enabledAccounts()) {
-			if (await this.syncAccount(account.id, { force: true })) result.synced++;
-			else result.failed++;
+	async syncAllAccounts(): Promise<{ accounts: number; failures: SyncFailure[] }> {
+		const accounts = this.enabledAccounts();
+		const failures: SyncFailure[] = [];
+		for (const account of accounts) {
+			failures.push(...(await this.syncAccount(account.id, { force: true })));
 		}
-		return result;
+		return { accounts: accounts.length, failures };
+	}
+
+	/** Runs one task's step; a failure is recorded and logged, and the run carries on. */
+	private async isolate(
+		failures: SyncFailure[],
+		path: string,
+		step: () => Promise<void>
+	): Promise<void> {
+		try {
+			await step();
+		} catch (error) {
+			failures.push({ path, message: describeError(error) });
+			this.logError("CalDAV sync failed for a task", error, { operation: "sync-task", path });
+		}
 	}
 
 	/**
@@ -893,42 +932,51 @@ export class CalDavSyncService {
 		return planFirstSync(locals, remotes);
 	}
 
-	/** Applies a plan the user has confirmed. */
-	async applyFirstSync(accountId: string, plan: FirstSyncPlan): Promise<void> {
+	/** Applies a plan the user has confirmed. Resolves with the tasks that failed, already logged. */
+	async applyFirstSync(accountId: string, plan: FirstSyncPlan): Promise<SyncFailure[]> {
 		const account = this.getAccount(accountId);
-		if (!account) return;
+		if (!account) return [];
+		const failures: SyncFailure[] = [];
 
 		for (const local of plan.toUpload) {
-			await this.pushTask(accountId, local.path);
+			await this.isolate(failures, local.path, () => this.pushTask(accountId, local.path));
 		}
 
 		for (const remote of plan.toImport) {
 			const withData = remote as RemoteSnapshotWithData;
-			if (withData.data) await this.applyRemotePatch(account, undefined, withData);
+			if (withData.data) {
+				await this.isolate(failures, `server task ${remote.uid}`, () =>
+					this.applyRemotePatch(account, undefined, withData)
+				);
+			}
 		}
 
 		for (const pair of plan.toLink) {
-			await this.stampSyncMetadata(pair.local.path, {
-				uid: pair.remote.uid,
-				href: pair.remote.url,
-				etag: pair.remote.etag,
-				accountId: account.id,
-			});
-			await this.indexResource({
-				accountId: account.id,
-				uid: pair.remote.uid,
-				path: pair.local.path,
-				href: pair.remote.url,
+			await this.isolate(failures, pair.local.path, async () => {
+				await this.stampSyncMetadata(pair.local.path, {
+					uid: pair.remote.uid,
+					href: pair.remote.url,
+					etag: pair.remote.etag,
+					accountId: account.id,
+				});
+				await this.indexResource({
+					accountId: account.id,
+					uid: pair.remote.uid,
+					path: pair.local.path,
+					href: pair.remote.url,
+				});
 			});
 		}
 
 		for (const pair of plan.toResolve) {
-			if (pair.winner === "local") {
-				await this.pushTask(accountId, pair.local.path);
-			} else {
+			await this.isolate(failures, pair.local.path, async () => {
+				if (pair.winner === "local") {
+					await this.pushTask(accountId, pair.local.path);
+					return;
+				}
 				const withData = pair.remote as RemoteSnapshotWithData;
 				if (withData.data) await this.applyRemotePatch(account, pair.local.path, withData);
-			}
+			});
 		}
 
 		// Only now does every task on both sides have both a path and a UID, so
@@ -937,8 +985,9 @@ export class CalDavSyncService {
 
 		this.logger.info("Completed first CalDAV sync", {
 			operation: "first-sync",
-			details: { accountId, ...summarizeFirstSyncPlan(plan) },
+			details: { accountId, ...summarizeFirstSyncPlan(plan), failed: failures.length },
 		});
+		return failures;
 	}
 
 	// -----------------------------------------------------------------------
@@ -1183,6 +1232,18 @@ function toRemoteSnapshot(
 	const uid = readVTodoUid(doc);
 	if (!uid) return null;
 	return { uid, url, etag, revisionMs: readVTodoRevision(doc), data };
+}
+
+/** Turns pulled fields into a TaskNotes update; null means the server has no value, so the field is cleared. */
+function toTaskUpdate(
+	changed: VTodoTaskPatch,
+	local: TaskInfo,
+	protectedTags: readonly string[]
+): Partial<TaskInfo> {
+	const updates: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(changed)) updates[key] = value ?? undefined;
+	if (changed.tags) updates.tags = mergeRemoteTags(changed.tags, local.tags, protectedTags);
+	return updates as Partial<TaskInfo>;
 }
 
 function scopeFor(account: CalDavAccountSettings): CalDavCollectionScope {
