@@ -229,7 +229,7 @@ export class CalDavSyncService {
 
 		const timer = window.setTimeout(() => {
 			this.pushTimers.delete(path);
-			void this.pushTask(account.id, path).catch((error: unknown) => {
+			void this.pushIfStillChanged(account.id, path).catch((error: unknown) => {
 				this.logError("Failed to push task", error, { operation: "push" });
 				// Without this the edit is simply lost until the task is touched
 				// again: a transient network failure would silently desync a task.
@@ -242,6 +242,18 @@ export class CalDavSyncService {
 	// -----------------------------------------------------------------------
 	// Push (local -> remote)
 	// -----------------------------------------------------------------------
+
+	/**
+	 * Re-checks the fingerprint when the debounce fires. An edit event can be
+	 * scheduled before our own inbound write records its fingerprint — a
+	 * TaskNotes rename, for one, announces the new path mid-update — and
+	 * pushing then would bounce the pulled content straight back.
+	 */
+	private async pushIfStillChanged(accountId: string, path: string): Promise<void> {
+		const task = await this.api.tasks.get(path);
+		if (task && this.state.fingerprints[path] === getCalDavRelevantFingerprint(task)) return;
+		await this.pushTask(accountId, path);
+	}
 
 	async pushTask(accountId: string, path: string): Promise<void> {
 		const account = this.getAccount(accountId);
@@ -444,9 +456,12 @@ export class CalDavSyncService {
 		const path = knownPath ?? (await this.findPathForUid(account.id, uid));
 
 		if (path) {
+			// A title change renames the note when TaskNotes stores titles in
+			// filenames, so everything after the update follows the returned path.
+			let currentPath = path;
 			this.handlingPaths.add(path);
 			try {
-				await this.api.tasks.update(
+				const updated = await this.api.tasks.update(
 					path,
 					{
 						...(patch.title !== undefined && { title: patch.title }),
@@ -460,17 +475,21 @@ export class CalDavSyncService {
 					},
 					CONTEXT
 				);
-				await this.stampSyncMetadata(path, {
+				currentPath = updated.path;
+				this.handlingPaths.add(currentPath);
+				await this.stampSyncMetadata(currentPath, {
 					uid,
 					href: remote.url,
 					etag: remote.etag,
 					accountId: account.id,
 				});
+				if (currentPath !== path) await this.forgetTask(path);
 			} finally {
 				this.handlingPaths.delete(path);
+				this.handlingPaths.delete(currentPath);
 			}
-			await this.indexResource({ accountId: account.id, uid, path, href: remote.url });
-			await this.applyInboundRelations(account, path, doc);
+			await this.indexResource({ accountId: account.id, uid, path: currentPath, href: remote.url });
+			await this.applyInboundRelations(account, currentPath, doc);
 			return;
 		}
 
@@ -505,7 +524,12 @@ export class CalDavSyncService {
 			CONTEXT
 		);
 
-		await this.recordFingerprint(created.path, getCalDavRelevantFingerprint(created));
+		// Fingerprint the task as TaskNotes reads it back, not the creation result:
+		// the empty-string dates above are normalised away on read, and a
+		// mismatch would bounce the import straight back to the server.
+		const stored = await this.api.tasks.get(created.path);
+		if (!stored) throw new Error(`TaskNotes did not return the imported task at ${created.path}`);
+		await this.recordFingerprint(created.path, getCalDavRelevantFingerprint(stored));
 		await this.indexResource({ accountId: account.id, uid, path: created.path, href: remote.url });
 		// Deferred: a parent imported later in this same run has no path yet.
 		this.pendingInboundRelations.push({ path: created.path, doc });
@@ -546,6 +570,7 @@ export class CalDavSyncService {
 
 		let unlinked = 0;
 		for (const path of paths) {
+			if (!this.getFile(path)) continue; // stale index entry
 			try {
 				await this.clearSyncMetadata(path);
 
@@ -834,11 +859,13 @@ export class CalDavSyncService {
 				return;
 			}
 
-			if (outcome.action === "archive" && !task.archived) {
-				await this.api.tasks.archive(path, true, CONTEXT);
-			}
+			// Archiving can move the note into the archive folder.
+			const currentPath =
+				outcome.action === "archive" && !task.archived
+					? (await this.api.tasks.archive(path, true, CONTEXT)).path
+					: path;
 			if (outcome.stripSyncMetadata) {
-				await this.clearSyncMetadata(path);
+				await this.clearSyncMetadata(currentPath);
 			}
 			await this.forgetTask(path);
 		} finally {
@@ -983,8 +1010,7 @@ export class CalDavSyncService {
 		path: string,
 		metadata: { uid: string; href: string; etag?: string; accountId: string }
 	): Promise<void> {
-		const file = this.getFile(path);
-		if (!file) return;
+		const file = this.requireFile(path);
 
 		await this.plugin.app.fileManager.processFrontMatter(file, (frontmatter) => {
 			frontmatter[CALDAV_FRONTMATTER_KEYS.uid] = metadata.uid;
@@ -1005,8 +1031,7 @@ export class CalDavSyncService {
 	}
 
 	private async clearSyncMetadata(path: string): Promise<void> {
-		const file = this.getFile(path);
-		if (!file) return;
+		const file = this.requireFile(path);
 
 		await this.plugin.app.fileManager.processFrontMatter(file, (frontmatter) => {
 			for (const key of Object.values(CALDAV_FRONTMATTER_KEYS)) {
@@ -1027,6 +1052,13 @@ export class CalDavSyncService {
 	private getFile(path: string): TFile | null {
 		const file = this.plugin.app.vault.getAbstractFileByPath(path);
 		return file instanceof TFile ? file : null;
+	}
+
+	/** For writes that must land: a missing note here means the sync lost track of it. */
+	private requireFile(path: string): TFile {
+		const file = this.getFile(path);
+		if (!file) throw new Error(`No note at ${path} to write CalDAV metadata to`);
+		return file;
 	}
 
 	// -----------------------------------------------------------------------
