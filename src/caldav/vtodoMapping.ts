@@ -53,6 +53,8 @@ export interface VTodoMappingContext {
 	zoneToUtc?: ZoneToUtc;
 	/** Tags kept out of CATEGORIES, e.g. the tag TaskNotes identifies task notes by. */
 	hiddenTags?: readonly string[];
+	/** The user's PRIORITY (0-9) per TaskNotes priority, over the defaults. */
+	priorityMap?: Readonly<Record<string, number>>;
 }
 
 /** The subset of a task that a remote VTODO can dictate. */
@@ -137,53 +139,97 @@ export function vTodoStatusToTaskStatus(
 // ---------------------------------------------------------------------------
 
 /**
- * Spreads the user's priorities across the 1-9 VTODO scale by weight, highest
- * weight to the lowest (most urgent) number. Deterministic in both directions,
- * so a value that leaves TaskNotes comes back as the same priority.
+ * Default PRIORITY per TaskNotes priority, anchored on the three bands clients
+ * such as Nextcloud Tasks and Apple Reminders display (RFC 5545 §3.8.1.9,
+ * https://www.rfc-editor.org/rfc/rfc5545#section-3.8.1.9): 1-4 high, 5 medium,
+ * 6-9 low. The lowest weight is low (9), the next is medium (5), the rest share
+ * 1-4. A zero-or-negative weight is "none", which RFC 5545 spells as 0.
  */
+export function defaultPriorityScale(priorities: readonly PriorityConfig[]): Map<string, number> {
+	const scale = new Map<string, number>();
+	for (const priority of priorities) if (priority.weight <= 0) scale.set(priority.value, 0);
+
+	const weighted = priorities.filter((priority) => priority.weight > 0).sort((a, b) => b.weight - a.weight);
+	const [low, medium] = [...weighted].reverse();
+	const high = weighted.slice(0, Math.max(0, weighted.length - 2));
+	high.forEach((priority, index) =>
+		scale.set(priority.value, high.length === 1 ? 1 : Math.round(1 + (index * 3) / (high.length - 1)))
+	);
+	if (medium) scale.set(medium.value, 5);
+	if (low) scale.set(low.value, medium ? 9 : 5);
+	return scale;
+}
+
+/** The default scale with the user's per-priority choices applied. */
+export function priorityScale(
+	priorities: readonly PriorityConfig[],
+	overrides: Readonly<Record<string, number>> = {}
+): Map<string, number> {
+	const scale = defaultPriorityScale(priorities);
+	for (const [value, chosen] of Object.entries(overrides)) {
+		if (scale.has(value) && isPriorityNumber(chosen)) scale.set(value, chosen);
+	}
+	return scale;
+}
+
+/** The PRIORITY to write, or undefined to write none. */
 export function taskPriorityToVTodo(
 	priorityValue: string,
 	context: VTodoMappingContext
 ): number | undefined {
-	const scale = buildPriorityScale(context.priorities);
-	return scale.get(priorityValue);
+	const mapped = priorityScale(context.priorities, context.priorityMap).get(priorityValue);
+	return mapped ? mapped : undefined;
 }
 
+/**
+ * The TaskNotes priority for a PRIORITY value; `undefined` means the property
+ * is absent, which RFC 5545 treats like 0. An exact match wins, then the
+ * nearest priority in the same band, then the nearest overall; ties go to the
+ * higher weight. Garbage yields undefined, so the note keeps its priority.
+ */
 export function vTodoPriorityToTaskPriority(
 	priority: number | undefined,
 	context: VTodoMappingContext
 ): string | undefined {
-	// 0 means "undefined" in RFC 5545.
-	if (priority === undefined || priority <= 0 || priority > 9) return undefined;
+	const scale = priorityScale(context.priorities, context.priorityMap);
+	const byWeight = [...context.priorities].sort((a, b) => b.weight - a.weight);
+	const entries = byWeight.map((config) => ({ value: config.value, mapped: scale.get(config.value) ?? 0 }));
 
-	const scale = buildPriorityScale(context.priorities);
+	if (priority === undefined || priority === 0) {
+		return entries.filter((entry) => entry.mapped === 0).pop()?.value;
+	}
+	if (!isPriorityNumber(priority)) return undefined;
+
+	const set = entries.filter((entry) => entry.mapped > 0);
+	const sameBand = set.filter((entry) => priorityBand(entry.mapped) === priorityBand(priority));
+	return nearest(sameBand, priority) ?? nearest(set, priority);
+}
+
+/**
+ * True when the server holds a PRIORITY other than the one the current scale
+ * gives this task, as after the user changed the scale.
+ */
+export function hasStalePriority(doc: VTodoDocument, task: TaskInfo, context: VTodoMappingContext): boolean {
+	const raw = getProperty(doc, "PRIORITY")?.value;
+	const onServer = raw === undefined ? 0 : Number.parseInt(raw, 10);
+	return onServer !== (taskPriorityToVTodo(task.priority, context) ?? 0);
+}
+
+function nearest(entries: readonly { value: string; mapped: number }[], priority: number): string | undefined {
 	let best: { value: string; distance: number } | undefined;
-	for (const [value, mapped] of scale) {
+	for (const { value, mapped } of entries) {
 		const distance = Math.abs(mapped - priority);
 		if (!best || distance < best.distance) best = { value, distance };
 	}
 	return best?.value;
 }
 
-function buildPriorityScale(priorities: PriorityConfig[]): Map<string, number> {
-	const scale = new Map<string, number>();
-	// A zero-or-negative weight is the "none" priority; RFC 5545 spells that as
-	// an absent PRIORITY rather than as 9, which would read as "lowest".
-	const ordered = priorities
-		.filter((priority) => priority.weight > 0)
-		.sort((a, b) => b.weight - a.weight);
-	if (ordered.length === 0) return scale;
+function priorityBand(priority: number): "high" | "medium" | "low" {
+	return priority <= 4 ? "high" : priority === 5 ? "medium" : "low";
+}
 
-	if (ordered.length === 1) {
-		scale.set(ordered[0].value, 5);
-		return scale;
-	}
-
-	ordered.forEach((priority, index) => {
-		const mapped = Math.round(1 + (index * 8) / (ordered.length - 1));
-		scale.set(priority.value, mapped);
-	});
-	return scale;
+function isPriorityNumber(value: number): boolean {
+	return Number.isInteger(value) && value >= 0 && value <= 9;
 }
 
 // ---------------------------------------------------------------------------
@@ -387,9 +433,10 @@ export function readVTodoIntoTaskPatch(
 	patch.completedDate = completed ? completed.slice(0, 10) : null;
 
 	const priorityRaw = getProperty(doc, "PRIORITY")?.value;
-	const priority = priorityRaw
-		? vTodoPriorityToTaskPriority(Number.parseInt(priorityRaw, 10), context)
-		: undefined;
+	const priority = vTodoPriorityToTaskPriority(
+		priorityRaw === undefined ? undefined : Number.parseInt(priorityRaw, 10),
+		context
+	);
 	if (priority) patch.priority = priority;
 
 	patch.tags = getTextListProperty(doc, "CATEGORIES");

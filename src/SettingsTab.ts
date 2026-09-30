@@ -12,6 +12,7 @@ import { CalDavClient, CalDavError, type CalDavCollectionInfo } from "./caldav/C
 import { CalDavSecretStore } from "./caldav/CalDavSecretStore";
 import { noticeFailures, type ListFirstSyncPreview } from "./CalDavSyncService";
 import { summarizeFirstSyncPlan } from "./caldav/caldavReconciliation";
+import { priorityScale } from "./caldav/vtodoMapping";
 import { createLogger } from "./log";
 import {
 	DEFAULT_ACCOUNT,
@@ -21,6 +22,20 @@ import {
 } from "./settings";
 
 const logger = createLogger("Settings");
+
+/** How one kind of chip list shows its values and turns typed input into one. */
+interface ChipKind {
+	placeholder: string;
+	display(value: string): string;
+	/** The value to store, or undefined to reject the input. */
+	parse(input: string): string | undefined;
+}
+
+const TAG_CHIPS: ChipKind = {
+	placeholder: "Add tag, press Enter",
+	display: (tag) => `#${tag}`,
+	parse: (input) => input.trim().replace(/^#/u, "") || undefined,
+};
 
 export class CalDavSettingTab extends PluginSettingTab {
 	private readonly secretStore: CalDavSecretStore;
@@ -87,6 +102,8 @@ export class CalDavSettingTab extends PluginSettingTab {
 				})
 			);
 
+		this.renderPriorities(containerEl);
+
 		for (const account of this.settings.accounts) {
 			this.renderAccount(containerEl, account);
 		}
@@ -105,6 +122,34 @@ export class CalDavSettingTab extends PluginSettingTab {
 					this.display();
 				})
 			);
+	}
+
+	/** One row per TaskNotes priority, choosing the PRIORITY it is sent as. */
+	private renderPriorities(containerEl: HTMLElement): void {
+		const heading = new Setting(containerEl).setName("Priorities").setHeading();
+		const priorities = this.plugin.sync?.priorities();
+		if (!priorities) {
+			heading.setDesc("Shown once TaskNotes is running.");
+			return;
+		}
+		heading.setDesc(
+			"What each TaskNotes priority is sent as. Task apps show 1–4 as high, 5 as medium and 6–9 as low. Numbers coming back that match no priority go to the nearest one in the same range."
+		);
+
+		const options: Record<string, string> = { "0": "0 · Not set" };
+		for (let n = 1; n <= 9; n++) options[String(n)] = `${n} · ${n <= 4 ? "High" : n === 5 ? "Medium" : "Low"}`;
+		const scale = priorityScale(priorities, this.settings.priorityMap);
+		for (const priority of [...priorities].sort((a, b) => b.weight - a.weight)) {
+			new Setting(containerEl).setName(priority.value).addDropdown((dropdown) =>
+				dropdown
+					.addOptions(options)
+					.setValue(String(scale.get(priority.value) ?? 0))
+					.onChange((value) => {
+						this.settings.priorityMap = { ...this.settings.priorityMap, [priority.value]: Number(value) };
+						this.save();
+					})
+			);
+		}
 	}
 
 	private renderAccount(containerEl: HTMLElement, account: CalDavAccountSettings): void {
@@ -160,14 +205,16 @@ export class CalDavSettingTab extends PluginSettingTab {
 			);
 
 		this.renderLists(body, account);
-		this.text(
-			body,
-			account,
-			"scopeFolder",
-			"Only tasks in folder",
-			"Pick up only tasks inside this folder (subfolders included). Leave empty for no folder restriction.",
-			"TaskNotes/Work"
-		);
+		const only = new Setting(body).setName("Only tasks in folders");
+		this.renderChips(only.descEl, account.includeFolders, "Pick up only tasks inside these folders, subfolders included. Leave empty for no folder restriction.", this.folderChips(), (folders) => {
+			account.includeFolders = folders;
+			this.save();
+		});
+		const neverIn = new Setting(body).setName("Never sync tasks in folders");
+		this.renderChips(neverIn.descEl, account.excludeFolders, "Tasks inside these folders, subfolders included, are not picked up. A synced task moved into one stops syncing, and its copy on the server is deleted.", this.folderChips(), (folders) => {
+			account.excludeFolders = folders;
+			this.save();
+		});
 
 		new Setting(body)
 			.setName("Check for changes every")
@@ -236,7 +283,9 @@ export class CalDavSettingTab extends PluginSettingTab {
 	private renderLists(body: HTMLElement, account: CalDavAccountSettings): void {
 		new Setting(body)
 			.setName("Task lists")
-			.setDesc("A task goes to the first list whose tags it has. When its tags change, it moves.")
+			.setDesc(
+				"A task goes to the first list whose tags it has or whose projects it belongs to, directly or as a subtask. When those change, it moves."
+			)
 			.setHeading()
 			.addButton((button) =>
 				button.setButtonText("Discover").onClick(() => void this.discoverCollections(account))
@@ -248,9 +297,14 @@ export class CalDavSettingTab extends PluginSettingTab {
 				cls: `tasknotes-caldav-list__status is-${list.initialSyncCompleted ? "syncing" : "setup"}`,
 				text: list.initialSyncCompleted ? "Syncing" : "Needs first sync",
 			});
-			const hint = list.id === account.defaultListId ? "Also takes everything else." : "Add at least one tag.";
-			this.renderTagChips(row.descEl, list.tags, list.tags.length === 0 ? hint : "", (tags) => {
+			const hint = list.id === account.defaultListId ? "Also takes everything else." : "Add at least one tag or project.";
+			const routesNothing = list.tags.length === 0 && list.projects.length === 0;
+			this.renderChips(row.descEl, list.tags, routesNothing ? hint : "", TAG_CHIPS, (tags) => {
 				list.tags = tags;
+				this.save();
+			});
+			this.renderChips(row.descEl, list.projects, "", this.projectChips(), (projects) => {
+				list.projects = projects;
 				this.save();
 			});
 			row.addExtraButton((button) =>
@@ -310,7 +364,7 @@ export class CalDavSettingTab extends PluginSettingTab {
 			});
 
 		const never = new Setting(body).setName("Never sync");
-		this.renderTagChips(never.descEl, account.excludeTags, "Tasks with any of these tags are not picked up.", (tags) => {
+		this.renderChips(never.descEl, account.excludeTags, "Tasks with any of these tags are not picked up.", TAG_CHIPS, (tags) => {
 			account.excludeTags = tags;
 			this.save();
 		});
@@ -323,6 +377,7 @@ export class CalDavSettingTab extends PluginSettingTab {
 			url,
 			name: collection?.displayName ?? "",
 			tags: [],
+			projects: [],
 			initialSyncCompleted: false,
 		};
 		account.lists.push(list);
@@ -330,45 +385,74 @@ export class CalDavSettingTab extends PluginSettingTab {
 		return list;
 	}
 
-	/** Tag chips with a remove button each, and an input that adds one on Enter. */
-	private renderTagChips(
+	/** Chips with a remove button each, and an input that adds one on Enter. */
+	private renderChips(
 		parent: HTMLElement,
 		initial: readonly string[],
 		hint: string,
-		onChange: (tags: string[]) => void
+		kind: ChipKind,
+		onChange: (values: string[]) => void
 	): void {
-		let tags = [...initial];
+		let values = [...initial];
 		if (hint) parent.createDiv({ text: hint });
 		const list = parent.createDiv({ cls: "tasknotes-caldav-tags" });
 		const render = () => {
 			list.empty();
-			for (const tag of tags) {
-				const chip = list.createSpan({ cls: "tasknotes-caldav-tags__chip", text: `#${tag}` });
-				const remove = chip.createSpan({ cls: "tasknotes-caldav-tags__remove", attr: { "aria-label": `Remove #${tag}` } });
+			for (const value of values) {
+				const label = kind.display(value);
+				const chip = list.createSpan({ cls: "tasknotes-caldav-tags__chip", text: label });
+				const remove = chip.createSpan({ cls: "tasknotes-caldav-tags__remove", attr: { "aria-label": `Remove ${label}` } });
 				setIcon(remove, "x");
 				remove.onclick = () => {
-					tags = tags.filter((candidate) => candidate !== tag);
-					onChange(tags);
+					values = values.filter((candidate) => candidate !== value);
+					onChange(values);
 					render();
 				};
 			}
 			const input = list.createEl("input", {
 				cls: "tasknotes-caldav-tags__input",
-				attr: { type: "text", placeholder: "Add tag, press Enter" },
+				attr: { type: "text", placeholder: kind.placeholder },
 			});
 			input.onkeydown = (event) => {
-				if (event.key !== "Enter") return;
-				const tag = input.value.trim().replace(/^#/u, "");
-				const known = tags.some((existing) => existing.toLowerCase() === tag.toLowerCase());
-				if (tag && !known) {
-					tags = [...tags, tag];
-					onChange(tags);
+				if (event.key !== "Enter" || !input.value.trim()) return;
+				const value = kind.parse(input.value);
+				const known = values.some((existing) => existing.toLowerCase() === value?.toLowerCase());
+				if (value !== undefined && !known) {
+					values = [...values, value];
+					onChange(values);
 				}
 				render();
 				list.querySelector<HTMLInputElement>(".tasknotes-caldav-tags__input")?.focus();
 			};
 		};
 		render();
+	}
+
+	private projectChips(): ChipKind {
+		return {
+			placeholder: "Add project, press Enter",
+			display: (path) => this.app.vault.getFileByPath(path)?.basename ?? path,
+			parse: (input) => {
+				const linkpath = input.trim().replace(/^\[\[|\]\]$/gu, "");
+				const file = this.app.metadataCache.getFirstLinkpathDest(linkpath, "");
+				if (file) return file.path;
+				new Notice(`There is no note "${linkpath}" in this vault.`);
+				return undefined;
+			},
+		};
+	}
+
+	private folderChips(): ChipKind {
+		return {
+			placeholder: "Add folder, press Enter",
+			display: (folder) => folder,
+			parse: (input) => {
+				const folder = input.trim().replace(/^\/+|\/+$/gu, "");
+				if (this.app.vault.getFolderByPath(folder)) return folder;
+				new Notice(`There is no folder "${folder}" in this vault.`);
+				return undefined;
+			},
+		};
 	}
 
 	private renderAccountHeader(header: HTMLElement, account: CalDavAccountSettings): void {
@@ -401,7 +485,7 @@ export class CalDavSettingTab extends PluginSettingTab {
 	private text(
 		containerEl: HTMLElement,
 		account: CalDavAccountSettings,
-		key: "name" | "serverUrl" | "username" | "scopeFolder",
+		key: "name" | "serverUrl" | "username",
 		name: string,
 		desc: string,
 		placeholder = "",

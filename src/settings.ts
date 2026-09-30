@@ -21,6 +21,8 @@ export interface CalDavTaskList {
 	name: string;
 	/** Tasks with any of these tags go here; nested tags (`work/client`) match `work`. */
 	tags: string[];
+	/** Vault paths of project notes; tasks linked to one, directly or through a parent task, go here. */
+	projects: string[];
 	/** Set once the user has confirmed the first-sync preview for this list. */
 	initialSyncCompleted: boolean;
 }
@@ -44,8 +46,10 @@ export interface CalDavAccountSettings {
 	defaultListId: string;
 	/** Tasks with any of these tags are never picked up. */
 	excludeTags: string[];
-	/** Only tasks inside this folder sync; empty means no folder restriction. */
-	scopeFolder: string;
+	/** Only tasks inside one of these folders sync; empty means no folder restriction. */
+	includeFolders: string[];
+	/** Tasks inside any of these folders are never picked up. */
+	excludeFolders: string[];
 	/** Overrides the status mapping auto-derived from StatusConfig flags. */
 	statusOverrides: Record<string, CalDavVTodoStatus>;
 	remoteDeletionPolicy: CalDavRemoteDeletionPolicy;
@@ -59,6 +63,8 @@ export interface CalDavSettings {
 	pushDebounceMs: number;
 	/** Send TaskNotes' task-identification tag as a CATEGORY. It is kept on notes either way. */
 	syncTaskTag: boolean;
+	/** PRIORITY (0-9) per TaskNotes priority value; missing ones take the default scale. */
+	priorityMap: Record<string, number>;
 	debugLogging: boolean;
 }
 
@@ -67,6 +73,7 @@ export const DEFAULT_SETTINGS: CalDavSettings = {
 	pushOnChange: true,
 	pushDebounceMs: 1500,
 	syncTaskTag: false, // Every synced task has it, so on the server it is noise
+	priorityMap: {},
 	debugLogging: false,
 };
 
@@ -79,7 +86,8 @@ export const DEFAULT_ACCOUNT: Omit<CalDavAccountSettings, "id"> = {
 	lists: [],
 	defaultListId: "",
 	excludeTags: [],
-	scopeFolder: "",
+	includeFolders: [],
+	excludeFolders: [],
 	statusOverrides: {},
 	remoteDeletionPolicy: "archive", // Never destroy notes without being asked
 };
@@ -93,13 +101,14 @@ export function mergeSettings(loaded: Partial<CalDavSettings> | undefined): CalD
 	};
 }
 
-/** Shapes saved before 0.4.0, when an account was a single list. */
+/** Shapes saved by older builds: before 0.4.0 an account was a single list. */
 interface LegacyAccountFields {
 	collectionUrl?: string;
 	scopeTag?: string; // 0.2.0
 	scopeTags?: string[]; // 0.3.x
 	scopeTagMode?: "include" | "exclude";
 	initialSyncCompleted?: boolean;
+	scopeFolder?: string; // before 0.5.0
 }
 
 /**
@@ -109,8 +118,11 @@ interface LegacyAccountFields {
  * otherwise the list takes everything else and an exclude filter stays one.
  */
 function migrateAccount(saved: Partial<CalDavAccountSettings> & LegacyAccountFields): CalDavAccountSettings {
-	const { collectionUrl, scopeTag, scopeTags, scopeTagMode, initialSyncCompleted, ...account } = saved;
+	const { collectionUrl, scopeTag, scopeTags, scopeTagMode, initialSyncCompleted, scopeFolder, ...account } = saved;
 	const merged = { ...DEFAULT_ACCOUNT, ...account } as CalDavAccountSettings;
+	const folder = scopeFolder?.trim().replace(/^\/+|\/+$/gu, "");
+	if (folder && !saved.includeFolders) merged.includeFolders = [folder];
+	merged.lists = merged.lists.map((list) => ({ ...list, projects: list.projects ?? [] }));
 	if (saved.lists || !collectionUrl) return merged;
 
 	const tags = scopeTags ?? (scopeTag?.trim() ? [scopeTag.trim()] : []);
@@ -121,10 +133,33 @@ function migrateAccount(saved: Partial<CalDavAccountSettings> & LegacyAccountFie
 			url: collectionUrl,
 			name: "",
 			tags: routed ? tags : [],
+			projects: [],
 			initialSyncCompleted: initialSyncCompleted ?? false,
 		},
 	];
 	merged.defaultListId = routed ? "" : merged.id;
 	merged.excludeTags = scopeTagMode === "exclude" ? tags : [];
 	return merged;
+}
+
+/**
+ * Points folder filters and project routes at a renamed note or folder, so a
+ * rename in the vault does not silently stop tasks from routing. Returns
+ * whether anything changed.
+ */
+export function followRename(settings: CalDavSettings, oldPath: string, newPath: string): boolean {
+	let changed = false;
+	const follow = (paths: string[]) =>
+		paths.map((path) => {
+			const renamed =
+				path === oldPath ? newPath : path.startsWith(`${oldPath}/`) ? newPath + path.slice(oldPath.length) : path;
+			changed ||= renamed !== path;
+			return renamed;
+		});
+	for (const account of settings.accounts) {
+		account.includeFolders = follow(account.includeFolders);
+		account.excludeFolders = follow(account.excludeFolders);
+		for (const list of account.lists) list.projects = follow(list.projects);
+	}
+	return changed;
 }

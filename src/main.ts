@@ -7,7 +7,7 @@ import {
 	type SyncState,
 } from "./CalDavSyncService";
 import { createLogger, logConfig } from "./log";
-import { mergeSettings, type CalDavSettings } from "./settings";
+import { followRename, mergeSettings, type CalDavSettings } from "./settings";
 import { CalDavSettingTab, confirm } from "./SettingsTab";
 import { getTaskNotesApi } from "./tasknotes";
 
@@ -42,6 +42,12 @@ export default class CalDavPlugin extends Plugin {
 			name: "Unlink all tasks from CalDAV",
 			callback: () => void this.unlinkAll(),
 		});
+
+		this.registerEvent(
+			this.app.vault.on("rename", (file, oldPath) => {
+				if (followRename(this.data.settings, oldPath, file.path)) void this.saveSettings();
+			})
+		);
 
 		// TaskNotes may load after us; its API only exists once every plugin is up.
 		this.app.workspace.onLayoutReady(() => void this.connect());

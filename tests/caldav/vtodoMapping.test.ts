@@ -3,8 +3,11 @@ import type { TaskInfo } from "../../src/tasknotes";
 import {
 	applyTaskToVTodo,
 	changedFields,
+	defaultPriorityScale,
+	hasStalePriority,
 	joinRecurrence,
 	mergeRemoteTags,
+	priorityScale,
 	reconcileStartAndDue,
 	readVTodoIntoTaskPatch,
 	readVTodoRevision,
@@ -90,33 +93,84 @@ describe("status mapping", () => {
 });
 
 describe("priority mapping", () => {
-	it("spreads priorities across the 1-9 scale, most urgent lowest", () => {
+	// P0 highest, P4 the zero-weight "none", as in a vault with Todoist-style priorities.
+	const numbered: VTodoMappingContext = {
+		...context,
+		priorities: [
+			{ value: "P4", weight: 0 },
+			{ value: "P3", weight: 1 },
+			{ value: "P2", weight: 2 },
+			{ value: "P1", weight: 3 },
+			{ value: "P0", weight: 4 },
+		],
+	};
+
+	it("maps three priorities onto high, medium and low", () => {
 		expect(taskPriorityToVTodo("high", context)).toBe(1);
 		expect(taskPriorityToVTodo("normal", context)).toBe(5);
 		expect(taskPriorityToVTodo("low", context)).toBe(9);
 	});
 
-	it("treats the zero-weight priority as no PRIORITY at all", () => {
-		expect(taskPriorityToVTodo("none", context)).toBeUndefined();
+	it("puts the lowest weight at low, the next at medium and spreads the rest over high", () => {
+		expect([...defaultPriorityScale(numbered.priorities)]).toEqual([
+			["P4", 0],
+			["P0", 1],
+			["P1", 4],
+			["P2", 5],
+			["P3", 9],
+		]);
 	});
 
-	it("round-trips every weighted priority", () => {
-		for (const value of ["high", "normal", "low"]) {
-			const mapped = taskPriorityToVTodo(value, context)!;
-			expect(vTodoPriorityToTaskPriority(mapped, context)).toBe(value);
+	it("treats the zero-weight priority as no PRIORITY at all", () => {
+		expect(taskPriorityToVTodo("none", context)).toBeUndefined();
+		expect(taskPriorityToVTodo("P4", numbered)).toBeUndefined();
+	});
+
+	it("round-trips every priority", () => {
+		for (const ctx of [context, numbered]) {
+			for (const { value } of ctx.priorities) {
+				expect(vTodoPriorityToTaskPriority(taskPriorityToVTodo(value, ctx), ctx)).toBe(value);
+			}
 		}
 	});
 
-	it("snaps an intermediate remote priority to the nearest configured one", () => {
-		expect(vTodoPriorityToTaskPriority(2, context)).toBe("high");
-		expect(vTodoPriorityToTaskPriority(4, context)).toBe("normal");
-		expect(vTodoPriorityToTaskPriority(8, context)).toBe("low");
+	it("reads other values by their RFC 5545 band first", () => {
+		const read = (n: number) => vTodoPriorityToTaskPriority(n, numbered);
+		expect([1, 2, 3, 4, 5, 6, 7, 8, 9].map(read)).toEqual(["P0", "P0", "P1", "P1", "P2", "P3", "P3", "P3", "P3"]);
+		expect(vTodoPriorityToTaskPriority(4, context)).toBe("high");
+		expect(vTodoPriorityToTaskPriority(6, context)).toBe("low");
 	});
 
-	it("treats 0 and out-of-range values as unset", () => {
-		expect(vTodoPriorityToTaskPriority(0, context)).toBeUndefined();
-		expect(vTodoPriorityToTaskPriority(undefined, context)).toBeUndefined();
-		expect(vTodoPriorityToTaskPriority(42, context)).toBeUndefined();
+	it("falls back to the nearest priority when a band has none, ties going to the higher", () => {
+		const two: VTodoMappingContext = { ...context, priorities: [{ value: "a", weight: 2 }, { value: "b", weight: 1 }] };
+		expect(vTodoPriorityToTaskPriority(1, two)).toBe("a");
+		expect(vTodoPriorityToTaskPriority(7, two)).toBe("b");
+		const ends: VTodoMappingContext = { ...two, priorityMap: { a: 1, b: 9 } };
+		expect(vTodoPriorityToTaskPriority(5, ends)).toBe("a");
+	});
+
+	it("reads 0 and an absent PRIORITY as the zero-weight priority, and garbage as nothing", () => {
+		expect(vTodoPriorityToTaskPriority(0, numbered)).toBe("P4");
+		expect(vTodoPriorityToTaskPriority(undefined, numbered)).toBe("P4");
+		expect(vTodoPriorityToTaskPriority(42, numbered)).toBeUndefined();
+		expect(vTodoPriorityToTaskPriority(Number.NaN, numbered)).toBeUndefined();
+	});
+
+	it("leaves 0 unread when no priority means none", () => {
+		const weighted: VTodoMappingContext = { ...context, priorities: [{ value: "p", weight: 1 }] };
+		expect(vTodoPriorityToTaskPriority(0, weighted)).toBeUndefined();
+	});
+
+	it("applies the user's choices over the defaults, ignoring invalid and unknown ones", () => {
+		const custom: VTodoMappingContext = { ...numbered, priorityMap: { P1: 3, P2: 12, gone: 1 } };
+		expect(taskPriorityToVTodo("P1", custom)).toBe(3);
+		expect(taskPriorityToVTodo("P2", custom)).toBe(5);
+		expect([...priorityScale(custom.priorities, custom.priorityMap).keys()]).not.toContain("gone");
+	});
+
+	it("lets two priorities share a number and reads it as the higher one", () => {
+		const shared: VTodoMappingContext = { ...numbered, priorityMap: { P1: 1 } };
+		expect(vTodoPriorityToTaskPriority(1, shared)).toBe("P0");
 	});
 
 	it("handles a single configured priority without dividing by zero", () => {
@@ -126,6 +180,25 @@ describe("priority mapping", () => {
 		};
 		expect(taskPriorityToVTodo("p", single)).toBe(5);
 		expect(vTodoPriorityToTaskPriority(5, single)).toBe("p");
+	});
+
+	it("clears a note's priority when the server drops PRIORITY", () => {
+		const doc = createVTodoDocument();
+		applyTaskToVTodo(doc, makeTask({ priority: "P2" }), numbered, { uid: "u" });
+		expect(getProperty(doc, "PRIORITY")?.value).toBe("5");
+		setTextProperty(doc, "PRIORITY", "0");
+		expect(readVTodoIntoTaskPatch(doc, numbered).priority).toBe("P4");
+	});
+
+	it("spots a PRIORITY written under an older scale", () => {
+		const doc = createVTodoDocument();
+		applyTaskToVTodo(doc, makeTask({ priority: "P2" }), numbered, { uid: "u" });
+		expect(hasStalePriority(doc, makeTask({ priority: "P2" }), numbered)).toBe(false);
+		setTextProperty(doc, "PRIORITY", "6");
+		expect(hasStalePriority(doc, makeTask({ priority: "P2" }), numbered)).toBe(true);
+		const none = createVTodoDocument();
+		applyTaskToVTodo(none, makeTask({ priority: "P4" }), numbered, { uid: "u" });
+		expect(hasStalePriority(none, makeTask({ priority: "P4" }), numbered)).toBe(false);
 	});
 });
 

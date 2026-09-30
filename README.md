@@ -1,6 +1,6 @@
 # TaskNotes CalDAV
 
-Keep your [TaskNotes](https://github.com/callumalpass/tasknotes) tasks in sync with CalDAV task lists — Nextcloud Tasks, Apple Reminders, Radicale, Baikal, anything that stores VTODOs. Create a task in Obsidian and it shows up on your phone a couple of seconds later. Tick it off on the phone and the note updates on the next sync. Tags decide which list a task lands in: `#work` to your Work list, `#home` to Home, everything else to a default list.
+Keep your [TaskNotes](https://github.com/callumalpass/tasknotes) tasks in sync with CalDAV task lists — Nextcloud Tasks, Apple Reminders, Radicale, Baikal, anything that stores VTODOs. Create a task in Obsidian and it shows up on your phone a couple of seconds later. Tick it off on the phone and the note updates on the next sync. Tags and projects decide which list a task lands in: `#work` to your Work list, everything in your *House* project to Home, everything else to a default list.
 
 This is a companion plugin: it does nothing on its own and needs TaskNotes installed and enabled. Your tasks stay ordinary Markdown notes; the plugin only adds a few `caldav_*` keys to their frontmatter.
 
@@ -29,8 +29,8 @@ The plugin is not in the community plugin directory (yet). Two ways to install i
    - iCloud: `https://caldav.icloud.com` with an app-specific password
    - Credentials are only ever sent over `https://` (plain `http://` is allowed for `localhost`).
 3. Under **Task lists**, press **Discover**. Event-only calendars, read-only subscriptions and deleted lists are filtered out.
-4. Route lists: pick a list under **Route another list** and give it one or more tags. Under **Everything else**, choose the list for tasks with none of those tags, or *Don't sync*. See [Task lists and tags](#task-lists-and-tags).
-5. Optionally keep tasks out: **Never sync** tags and/or **Only tasks in folder**.
+4. Route lists: pick a list under **Route another list** and give it tags, projects, or both. Under **Everything else**, choose the list for tasks that match none of them, or *Don't sync*. See [Task lists, tags and projects](#task-lists-tags-and-projects).
+5. Optionally keep tasks out: **Never sync** tags, **Only tasks in folders** and **Never sync tasks in folders**. Subfolders count, and a task in a never-sync folder stays out even inside an only-these folder.
 6. Turn on **Sync this account**, then press **Preview first sync**. For each new list you get the numbers — to upload, to import, already matching, changed on both sides, moving in from other lists — and nothing is written until you confirm. A list only starts syncing after its first sync.
 
 Two commands are available from the command palette: **Sync tasks with CalDAV now** and **Unlink all tasks from CalDAV**.
@@ -52,23 +52,29 @@ Two commands are available from the command palette: **Sync tasks with CalDAV no
 
 The note body is **not** synced. Anything the plugin doesn't model — a description written on the phone, attachments, custom `X-` properties — is left exactly as it was on the server.
 
-**Statuses and priorities.** TaskNotes lets you define your own, CalDAV has a fixed set. A status marked *completed* becomes `COMPLETED`, one marked *skipped* becomes `CANCELLED`, everything else `NEEDS-ACTION`. Coming back, `NEEDS-ACTION` maps to your first open status by order. Priorities are spread across CalDAV's 1–9 scale by their weight.
+**Statuses.** TaskNotes lets you define your own, CalDAV has a fixed set. A status marked *completed* becomes `COMPLETED`, one marked *skipped* becomes `CANCELLED`, everything else `NEEDS-ACTION`. Coming back, `NEEDS-ACTION` maps to your first open status by order.
+
+**Priorities.** CalDAV has 1–9 plus 0 for *not set*, and task apps show them in three bands: 1–4 high, 5 medium, 6–9 low. By default your lowest-weight priority is sent as 9, the next as 5, and the rest are shared across 1–4, highest weight first; a priority with weight 0 is *not set*. With TaskNotes' own low/normal/high that is 9/5/1, what Apple Reminders uses. Under **Priorities** in the settings you can pick the number for each one. A number coming back that matches none of yours goes to the nearest priority in the same band, so a *medium* set on the phone never turns into a high one. Clearing the priority on the phone sets the note to your weight-0 priority.
 
 **The task tag.** TaskNotes recognises task notes by a tag (`#task` by default). Every synced task would carry it, so it's left off the server unless you turn on *Sync the task tag*. Your notes always keep it, even when a phone app edits or drops a task's categories.
 
 **Subtasks.** A subtask is a task whose *Projects* field links to another task, and it arrives on the server as a real subtask. A link is only sent once both tasks exist on the server; projects that are plain notes rather than tasks are left out.
 
-## Task lists and tags
+## Task lists, tags and projects
 
-An account is one server login; it can sync any number of its lists. Each list gets tags, and the rows are tried top to bottom:
+An account is one server login; it can sync any number of its lists. Each list gets tags, projects, or both, and the rows are tried top to bottom:
 
-- **A new task** goes to the first list whose tags it has (nested tags count: `work` also matches `work/client`), otherwise to the *Everything else* list, otherwise nowhere.
+- **A new task** goes to the first list whose tags it has (nested tags count: `work` also matches `work/client`) or whose projects it belongs to, otherwise to the *Everything else* list, otherwise nowhere.
+- **Belonging to a project** means linking it in the task's *Projects* field, or being a subtask of a task that does, however deep. A whole subtask tree lands in one list, which matters because task apps only nest subtasks within a list. Add a project by typing its note's name; renaming or moving the note later keeps the route.
 - **Changing a task's tags** moves it: tag a Home task `#work` and it is deleted from Home and created in Work, with the same UID and anything a phone app added (a description, say) carried over. A task stays put as long as it still has one of its list's tags, so a Work task that also gets `#home` stays in Work. Losing its list's tag sends it to *Everything else*; with nowhere to go, it stays where it is.
-- **Moving a task between lists on the phone** swaps its tags: moved from Work to Home, the note loses `#work` and gains `#home`. It is not mistaken for a deletion.
-- **A task created in a list on the phone** arrives with that list's first tag.
+- **Moving a task between lists on the phone** swaps its tags: moved from Work to Home, the note loses `#work` and gains `#home`. It is not mistaken for a deletion. Project lists work the same way: moved out, the task loses its link to that list's project; moved in, it gets a link to the list's first project, unless it already belongs to one of them. Links to other projects stay.
+- **A task created in a list on the phone** arrives with that list's first tag, or a link to its first project when the list has no tags.
 - **The routing tag stays off the server.** Every task in Work would carry `work`, so it's hidden like the task tag, and a phone app editing categories can't remove it from the note.
 - **Editing a list's tags in settings** moves the affected tasks on the next sync. **Removing a list** moves its tasks where their tags now point; a task with nowhere to go is unlinked, and its copy stays on the server.
-- **Never sync** and the folder only decide which tasks get picked up. A task that's already synced keeps syncing when it gains a *Never sync* tag; unlink it to stop.
+- **Never sync** tags and *Only tasks in folders* only decide which tasks get picked up. A task that's already synced keeps syncing when it gains a *Never sync* tag or leaves those folders; unlink it to stop.
+- **A never-sync folder takes tasks out of sync.** Move a synced note into one and, on its next push or sync, its copy is deleted from the server and its `caldav_*` keys are removed from the note. Nothing else in the note changes. The server copy has to go, because a copy nothing links to would come back as a new note on the next poll.
+
+Upgrading from 0.4: *Only tasks in folder* becomes a one-entry folder list, and lists route by no project until you add one. If the default priority numbers changed for you, the first sync after the upgrade sends every affected task once more with its new number. Nothing in your notes changes.
 
 Upgrading from 0.3: an account's list becomes its only list. An include tag filter becomes that list's tags; otherwise the list takes *Everything else*, and an exclude filter becomes *Never sync*. Nothing in your notes changes.
 
@@ -89,6 +95,7 @@ Upgrading from 0.3: an account's list becomes its only list. An include tag filt
 - If TaskNotes stores titles in filenames (its default), characters that can't go in a filename, like `:`, are dropped from titles pulled in from the server. The server keeps its version; the plugin doesn't push the shortened title back.
 - An `IN-PROCESS` status from the server can't be told apart from "not started" unless your statuses make it obvious. The plugin picks your second open status.
 - If you disable TaskNotes while this plugin is running, sync stops. Reload this plugin after re-enabling TaskNotes.
+- When a parent task moves to another project, its subtasks follow on the next sync that finds something changed on the server (or on **Sync tasks with CalDAV now**), not right away, because their own notes didn't change.
 
 ## Privacy
 
@@ -109,7 +116,7 @@ src/tasknotes.ts          the slice of the TaskNotes runtime API used, plus the 
 src/CalDavSyncService.ts  push, pull, conflicts, relations, retry queue
 src/SettingsTab.ts        account settings UI
 src/settings.ts           settings types and defaults
-src/caldav/               pure modules: CalDAV client, XML, ICS dates, VTODO mapping, tag routing, reconciliation
+src/caldav/               pure modules: CalDAV client, XML, ICS dates, VTODO mapping, tag and project routing, reconciliation
 tests/caldav/             unit tests for src/caldav/
 ```
 
