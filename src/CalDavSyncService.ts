@@ -66,7 +66,7 @@ import {
 	type VTodoDocument,
 } from "./caldav/vtodoDocument";
 import { applyReminders, readReminders } from "./caldav/vtodoAlarms";
-import { applyRelations, readRelations, type VTodoRelations } from "./caldav/vtodoRelations";
+import { applyRelations, hasStaleRelations, readRelations, type VTodoRelations } from "./caldav/vtodoRelations";
 
 /** How often the retry queue is drained. */
 const RETRY_QUEUE_INTERVAL_MS = 60_000;
@@ -631,11 +631,18 @@ export class CalDavSyncService {
 		return moved;
 	}
 
-	/** One list's share of a poll: pull, resolve, delete and push as planned. */
+	/**
+	 * One list's share of a poll: pull, resolve, delete and push as planned.
+	 *
+	 * `handled` holds the tasks earlier steps of this run took care of, and
+	 * this pass adds the ones it pushes: a push can move a task into a list
+	 * processed later, whose listing predates the move and would read the new
+	 * copy as deleted on the server.
+	 */
 	private async syncList(
 		target: SyncTarget,
 		remotes: readonly RemoteSnapshotWithData[],
-		skipPaths: ReadonlySet<string>
+		handled: Set<string>
 	): Promise<SyncFailure[]> {
 		const failures: SyncFailure[] = [];
 		// Released tasks leave the plan even when the release fails, or their
@@ -643,7 +650,7 @@ export class CalDavSyncService {
 		const released = new Set<string>();
 		const locals: LocalTaskSnapshot[] = [];
 		for (const local of await this.snapshotListTasks(target)) {
-			if (skipPaths.has(local.path)) continue;
+			if (handled.has(local.path)) continue;
 			if (local.uid && (await this.releasedLink(local.path))) {
 				released.add(local.uid);
 				await this.isolate(failures, local.path, () => this.releaseTask(target, local.path));
@@ -660,8 +667,8 @@ export class CalDavSyncService {
 		// Linked here but now routed elsewhere, e.g. after its list's tags were
 		// edited in settings: pushing moves it. Likewise a task the server still
 		// holds under an older priority scale, which would otherwise read back
-		// as a different priority on its next pull, or without its current
-		// project prefix.
+		// as a different priority on its next pull, without its current project
+		// prefix, or with relations it no longer has, such as a deleted parent.
 		const planned = new Set(
 			[...plan.toPush, ...plan.remoteDeleted, ...plan.conflicts.map((conflict) => conflict.local)].map(
 				(local) => local.path
@@ -679,7 +686,8 @@ export class CalDavSyncService {
 			const stale =
 				held !== null &&
 				((rescaled && hasStalePriority(held, task, this.mappingContext(target))) ||
-					hasStaleProjects(held, await this.projectNames(task)));
+					hasStaleProjects(held, await this.projectNames(task)) ||
+					hasStaleRelations(held, (await this.resolveOutboundRelations(task)).relations));
 			if ((routed && routed.list.id !== target.list.id) || stale) plan.toPush.push(local);
 		}
 
@@ -695,6 +703,7 @@ export class CalDavSyncService {
 		for (const conflict of plan.conflicts) {
 			await this.isolate(failures, conflict.local.path, async () => {
 				if (conflict.winner === "local") {
+					handled.add(conflict.local.path);
 					await this.pushTask(conflict.local.path);
 					return;
 				}
@@ -708,6 +717,7 @@ export class CalDavSyncService {
 		}
 
 		for (const local of plan.toPush) {
+			handled.add(local.path);
 			await this.isolate(failures, local.path, () => this.pushTask(local.path));
 		}
 
@@ -1117,40 +1127,64 @@ export class CalDavSyncService {
 	/**
 	 * Writes a remote VTODO's relations and reminders back onto a task.
 	 *
-	 * Both are non-destructive: a relation whose target is not in this vault, or
-	 * an alarm list a foreign client stripped, must not erase what the vault
-	 * already holds. Only resolved values are written, and only the project
-	 * links the server can know about, those to synced tasks, are replaced:
-	 * links to plain project notes never leave the vault.
+	 * The server only knows relations to synced tasks, so only those are
+	 * replaced, by nothing too when a phone app removed them. Links to plain
+	 * project notes and to unsynced tasks stay where they are, and a relation
+	 * whose target is not in this vault is dropped. Reminders are only ever
+	 * written, never cleared: a client that strips alarms it does not
+	 * understand must not erase the note's.
 	 */
 	private async applyInboundRelations(path: string, doc: VTodoDocument): Promise<void> {
+		const local = await this.api.tasks.get(path);
+		if (!local) return;
 		const { parents, dependencies } = readRelations(doc);
 		const reminders = readReminders(doc);
+		const synced = (target: string | undefined) => target !== undefined && this.uidForPath(target) !== undefined;
+		const fileForUid = async (uid: string) => {
+			const target = await this.findPathForUid(uid);
+			return target ? this.getFile(target) : null;
+		};
 
-		const projects: string[] = [];
+		const parentFiles: TFile[] = [];
 		for (const uid of parents) {
-			const parentPath = await this.findPathForUid(uid);
-			const file = parentPath ? this.getFile(parentPath) : null;
-			if (file) projects.push(this.wikilink(file, path));
+			const file = await fileForUid(uid);
+			if (file) parentFiles.push(file);
 		}
+		const keptProjects = this.projectLinks(local).filter(
+			(project) => !synced(project.path) || parentFiles.some((file) => file.path === project.path)
+		);
+		const projects = [
+			...keptProjects.map((project) => project.link),
+			...parentFiles
+				.filter((file) => !keptProjects.some((project) => project.path === file.path))
+				.map((file) => this.wikilink(file, path)),
+		];
 
-		const blockedBy: TaskDependency[] = [];
+		const dependencyKey = (target: string | undefined, dependency: TaskDependency) =>
+			[target, dependency.reltype, dependency.gap ?? ""].join("|");
+		const remoteDependencies: { key: string; dependency: TaskDependency }[] = [];
 		for (const dependency of dependencies) {
-			const targetPath = await this.findPathForUid(dependency.uid);
-			const file = targetPath ? this.getFile(targetPath) : null;
-			if (file) blockedBy.push({ ...dependency, uid: this.wikilink(file, path) });
+			const file = await fileForUid(dependency.uid);
+			if (file) {
+				remoteDependencies.push({
+					key: dependencyKey(file.path, dependency),
+					dependency: { ...dependency, uid: this.wikilink(file, path) },
+				});
+			}
 		}
-
-		const local = await this.api.tasks.get(path);
-		const unsynced = local
-			? this.projectLinks(local)
-					.filter((project) => !project.path || !this.uidForPath(project.path))
-					.map((project) => project.link)
-			: [];
+		const keptDependencies = (local.blockedBy ?? []).filter((dependency) => {
+			const target = this.linkTarget(dependency.uid, path);
+			return !synced(target) || remoteDependencies.some((remote) => remote.key === dependencyKey(target, dependency));
+		});
+		const keptKeys = keptDependencies.map((dependency) => dependencyKey(this.linkTarget(dependency.uid, path), dependency));
+		const blockedBy = [
+			...keptDependencies,
+			...remoteDependencies.filter((remote) => !keptKeys.includes(remote.key)).map((remote) => remote.dependency),
+		];
 
 		const updates: Partial<TaskInfo> = {};
-		if (projects.length > 0) updates.projects = [...unsynced, ...projects];
-		if (blockedBy.length > 0) updates.blockedBy = blockedBy;
+		if (JSON.stringify(projects) !== JSON.stringify(local.projects ?? [])) updates.projects = projects;
+		if (JSON.stringify(blockedBy) !== JSON.stringify(local.blockedBy ?? [])) updates.blockedBy = blockedBy;
 		if (reminders.length > 0) updates.reminders = reminders;
 		if (Object.keys(updates).length === 0) return;
 
@@ -1246,14 +1280,21 @@ export class CalDavSyncService {
 	private projectLinks(task: TaskInfo): ProjectLink[] {
 		return (task.projects ?? [])
 			.filter((link) => linkpathOf(link))
-			.map((link) => ({ link, path: this.plugin.app.metadataCache.getFirstLinkpathDest(linkpathOf(link), task.path)?.path }));
+			.map((link) => ({ link, path: this.linkTarget(link, task.path) }));
 	}
 
-	/** A task's links to project notes rather than parent tasks. A link to no note at all names a project too. */
+	private linkTarget(link: string, sourcePath: string): string | undefined {
+		return this.plugin.app.metadataCache.getFirstLinkpathDest(linkpathOf(link), sourcePath)?.path;
+	}
+
+	/**
+	 * A task's links to project notes rather than parent tasks. A link to no
+	 * note at all is not a project: it may be a parent task that was deleted.
+	 */
 	private async plainProjectLinks(task: TaskInfo): Promise<ProjectLink[]> {
 		const plain: ProjectLink[] = [];
 		for (const project of this.projectLinks(task)) {
-			if (!project.path || !(await this.api.tasks.get(project.path))) plain.push(project);
+			if (project.path && !(await this.api.tasks.get(project.path))) plain.push(project);
 		}
 		return plain;
 	}
@@ -1261,15 +1302,14 @@ export class CalDavSyncService {
 	/** Names of the project notes a task links itself, for the server's title prefix. */
 	private async projectNames(task: TaskInfo): Promise<string[]> {
 		return (await this.plainProjectLinks(task)).map(
-			({ link, path }) => (path && this.getFile(path)?.basename) || linkpathOf(link).split("/").pop() || link
+			({ link, path }) => (path && this.getFile(path)?.basename) || linkpathOf(link)
 		);
 	}
 
 	/**
 	 * The project notes a task belongs to: those it links, and those its parent
-	 * tasks link, however deep. Unresolved links count by their text. Skipped
-	 * entirely while no account treats project tasks specially, since it costs
-	 * a lookup per ancestor.
+	 * tasks link, however deep. Skipped entirely while no account treats
+	 * project tasks specially, since it costs a lookup per ancestor.
 	 */
 	private async projectAncestry(task: TaskInfo): Promise<string[]> {
 		if (!this.settings.accounts.some((account) => account.excludeProjectTasks || account.projectListId)) return [];
@@ -1279,13 +1319,12 @@ export class CalDavSyncService {
 		while (level.length > 0) {
 			const next: TaskInfo[] = [];
 			for (const current of level) {
-				for (const { link, path } of this.projectLinks(current)) {
-					const key = path ?? link;
-					if (seen.has(key)) continue;
-					seen.add(key);
-					const parent = path ? await this.api.tasks.get(path) : null;
+				for (const { path } of this.projectLinks(current)) {
+					if (!path || seen.has(path)) continue;
+					seen.add(path);
+					const parent = await this.api.tasks.get(path);
 					if (parent) next.push(parent);
-					else projects.add(key);
+					else projects.add(path);
 				}
 			}
 			level = next;

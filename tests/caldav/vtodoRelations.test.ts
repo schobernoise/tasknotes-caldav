@@ -1,5 +1,6 @@
 import {
 	applyRelations,
+	hasStaleRelations,
 	ownsRelation,
 	readRelations,
 } from "../../src/caldav/vtodoRelations";
@@ -144,5 +145,28 @@ describe("ownsRelation", () => {
 		expect(ownsRelation({ name: "RELATED-TO", params: { RELTYPE: "SIBLING" }, value: "x" })).toBe(
 			false
 		);
+	});
+});
+
+describe("hasStaleRelations", () => {
+	const dependency = { uid: "dep", reltype: "FINISHTOSTART" as const };
+
+	it("finds nothing stale when the server holds exactly the task's relations, in any order", () => {
+		const doc = docWith("RELATED-TO:b", "RELATED-TO;RELTYPE=PARENT:a", "RELATED-TO;RELTYPE=FINISHTOSTART:dep");
+		expect(hasStaleRelations(doc, { parents: ["a", "b", "a"], dependencies: [dependency] })).toBe(false);
+	});
+
+	it("spots a parent the task no longer has, such as a deleted one", () => {
+		expect(hasStaleRelations(docWith("RELATED-TO:gone"), { parents: [], dependencies: [] })).toBe(true);
+	});
+
+	it("spots a missing parent and a changed gap", () => {
+		expect(hasStaleRelations(docWith(), { parents: ["a"], dependencies: [] })).toBe(true);
+		const doc = docWith("RELATED-TO;RELTYPE=FINISHTOSTART;GAP=PT1H:dep");
+		expect(hasStaleRelations(doc, { parents: [], dependencies: [dependency] })).toBe(true);
+	});
+
+	it("ignores reltypes TaskNotes does not own", () => {
+		expect(hasStaleRelations(docWith("RELATED-TO;RELTYPE=SIBLING:x"), { parents: [], dependencies: [] })).toBe(false);
 	});
 });

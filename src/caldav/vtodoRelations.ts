@@ -113,6 +113,20 @@ export function applyRelations(doc: VTodoDocument, relations: VTodoRelations): v
 	replaceProperties(doc, RELATED_TO, ownsRelation, replacements);
 }
 
+/**
+ * True when the relations TaskNotes owns on the server differ from
+ * `relations`, as when a parent was deleted and the subtask still points at
+ * its UID. Order and duplicates do not count.
+ */
+export function hasStaleRelations(doc: VTodoDocument, relations: VTodoRelations): boolean {
+	const key = ({ parents, dependencies }: VTodoRelations) =>
+		JSON.stringify([
+			[...new Set(parents.map((uid) => uid.trim()))].sort(),
+			[...new Set(dependencies.map((dependency) => [dependency.uid.trim(), dependency.reltype, dependency.gap ?? ""].join("|")))].sort(),
+		]);
+	return key(readRelations(doc)) !== key(relations);
+}
+
 function dedupe(values: readonly string[]): string[] {
 	const seen: string[] = [];
 	for (const value of values) {
