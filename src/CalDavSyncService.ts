@@ -11,7 +11,7 @@
  * excludes every `caldav_*` key is what stops the cycle. See caldavFingerprint.ts.
  */
 
-import { Notice, TFile } from "obsidian";
+import { type App, moment, Notice, TFile } from "obsidian";
 
 import type CalDavPlugin from "./main";
 import type { CalDavAccountSettings, CalDavTaskList } from "./settings";
@@ -1294,9 +1294,27 @@ export class CalDavSyncService {
 	private async plainProjectLinks(task: TaskInfo): Promise<ProjectLink[]> {
 		const plain: ProjectLink[] = [];
 		for (const project of this.projectLinks(task)) {
-			if (project.path && !(await this.api.tasks.get(project.path))) plain.push(project);
+			if (project.path && (await this.isProjectNote(project.path))) plain.push(project);
 		}
 		return plain;
+	}
+
+	/** A linked note that makes a task a project task: neither a task nor a daily note. */
+	private async isProjectNote(path: string): Promise<boolean> {
+		return !this.isDailyNote(path) && !(await this.api.tasks.get(path));
+	}
+
+	/**
+	 * A note in the folder and name format of Obsidian's Daily notes plugin. A
+	 * task linked to the day it belongs to is not a project task.
+	 */
+	private isDailyNote(path: string): boolean {
+		const options = dailyNoteOptions(this.plugin.app);
+		if (!options) return false;
+		const folder = (options.folder ?? "").replace(/^\/+|\/+$/gu, "");
+		const name = (path.split("/").pop() ?? "").replace(/\.md$/u, "");
+		const inFolder = folder === "" ? !path.includes("/") : path.startsWith(`${folder}/`);
+		return inFolder && parseMoment(name, options.format || "YYYY-MM-DD", true).isValid();
 	}
 
 	/** Names of the project notes a task links itself, for the server's title prefix. */
@@ -1324,7 +1342,7 @@ export class CalDavSyncService {
 					seen.add(path);
 					const parent = await this.api.tasks.get(path);
 					if (parent) next.push(parent);
-					else projects.add(path);
+					else if (!this.isDailyNote(path)) projects.add(path);
 				}
 			}
 			level = next;
@@ -1339,7 +1357,7 @@ export class CalDavSyncService {
 	private async projectFromPrefix(title: string, sourcePath: string): Promise<{ title: string; link: string } | undefined> {
 		const parsed = parseProjectPrefix(title);
 		const file = parsed ? this.plugin.app.metadataCache.getFirstLinkpathDest(parsed.project, sourcePath) : null;
-		if (!parsed || !file || (await this.api.tasks.get(file.path))) return undefined;
+		if (!parsed || !file || !(await this.isProjectNote(file.path))) return undefined;
 		return { title: parsed.title, link: this.wikilink(file, sourcePath) };
 	}
 
@@ -1758,6 +1776,20 @@ function routingFor(account: CalDavAccountSettings): AccountRouting {
 
 function routeOf(list: CalDavTaskList): TaskListRoute {
 	return { listId: list.id, tags: list.tags };
+}
+
+/** Obsidian's bundled moment; its type declaration is a namespace, which this tsconfig cannot call. */
+const parseMoment = moment as unknown as (input: string, format: string, strict: boolean) => { isValid(): boolean };
+
+/**
+ * Folder and name format of the core Daily notes plugin, or undefined while it
+ * is off. Obsidian's public API does not expose them.
+ */
+function dailyNoteOptions(app: App): { folder?: string; format?: string } | undefined {
+	const internal = (app as unknown as {
+		internalPlugins?: { getEnabledPluginById?(id: string): { options?: { folder?: string; format?: string } } | null };
+	}).internalPlugins;
+	return internal?.getEnabledPluginById?.("daily-notes")?.options;
 }
 
 /** The target of a frontmatter link: `[[Folder/Note#Heading|Alias]]` gives `Folder/Note`. */

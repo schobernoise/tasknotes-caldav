@@ -61,7 +61,7 @@ The note body is **not** synced. Anything the plugin doesn't model — a descrip
 
 **Subtasks.** A subtask is a task whose *Projects* field links to another task, and it arrives on the server as a real subtask. A link is only sent once both tasks exist on the server. Nesting, un-nesting or re-parenting a subtask on the phone carries over to the note, and so does removing a dependency; links to tasks that aren't synced are left alone.
 
-**Projects.** A task whose *Projects* field links a plain note (an existing note that isn't a task) carries those notes' names in `X-TASKNOTES-PROJECTS`. Task apps don't show that, so the title on the server also starts with the first project: `House | Fix the roof`. The prefix only exists on the server; your note's title stays `Fix the roof`. Edit the prefix on the phone and it's put back on the next sync. A task that belongs to a project only through its parent task gets no prefix, since it sits under that parent anyway.
+**Projects.** A task whose *Projects* field links a plain note (an existing note that isn't a task or a daily note) carries those notes' names in `X-TASKNOTES-PROJECTS`. Task apps don't show that, so the title on the server also starts with the first project: `House | Fix the roof`. The prefix only exists on the server; your note's title stays `Fix the roof`. Edit the prefix on the phone and it's put back on the next sync. A task that belongs to a project only through its parent task gets no prefix, since it sits under that parent anyway.
 
 ## Task lists, tags and projects
 
