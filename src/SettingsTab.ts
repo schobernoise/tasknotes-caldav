@@ -278,13 +278,13 @@ export class CalDavSettingTab extends PluginSettingTab {
 
 	/**
 	 * The routing table: one row per list with the tags that send tasks there,
-	 * then where everything else goes and what never syncs.
+	 * then where everything else and project tasks go, and what never syncs.
 	 */
 	private renderLists(body: HTMLElement, account: CalDavAccountSettings): void {
 		new Setting(body)
 			.setName("Task lists")
 			.setDesc(
-				"A task goes to the first list whose tags it has or whose projects it belongs to, directly or as a subtask. When those change, it moves."
+				"A task goes to the first list whose tags it has. When its tags change, it moves."
 			)
 			.setHeading()
 			.addButton((button) =>
@@ -297,14 +297,14 @@ export class CalDavSettingTab extends PluginSettingTab {
 				cls: `tasknotes-caldav-list__status is-${list.initialSyncCompleted ? "syncing" : "setup"}`,
 				text: list.initialSyncCompleted ? "Syncing" : "Needs first sync",
 			});
-			const hint = list.id === account.defaultListId ? "Also takes everything else." : "Add at least one tag or project.";
-			const routesNothing = list.tags.length === 0 && list.projects.length === 0;
-			this.renderChips(row.descEl, list.tags, routesNothing ? hint : "", TAG_CHIPS, (tags) => {
+			const hint =
+				!account.excludeProjectTasks && list.id === account.projectListId
+					? "Takes project tasks."
+					: list.id === account.defaultListId
+						? "Also takes everything else."
+						: "Add at least one tag.";
+			this.renderChips(row.descEl, list.tags, list.tags.length === 0 ? hint : "", TAG_CHIPS, (tags) => {
 				list.tags = tags;
-				this.save();
-			});
-			this.renderChips(row.descEl, list.projects, "", this.projectChips(), (projects) => {
-				list.projects = projects;
 				this.save();
 			});
 			row.addExtraButton((button) =>
@@ -347,26 +347,62 @@ export class CalDavSettingTab extends PluginSettingTab {
 			});
 		}
 
-		new Setting(body)
+		const everythingElse = new Setting(body)
 			.setName("Everything else")
-			.setDesc("Where tasks go that have none of the tags above.")
-			.addDropdown((dropdown) => {
-				dropdown.addOption("", "Don't sync");
-				for (const list of account.lists) dropdown.addOption(list.id, list.name || list.url);
-				for (const collection of unrouted) dropdown.addOption(collection.url, collection.displayName);
-				dropdown.setValue(account.defaultListId).onChange((value) => {
-					account.defaultListId = account.lists.some((list) => list.id === value)
-						? value
-						: value && this.addList(account, value).id;
-					this.save();
-					this.display();
-				});
+			.setDesc("Where tasks go that have none of the tags above.");
+		this.listDropdown(everythingElse, account, unrouted, "Don't sync", account.defaultListId, (listId) => {
+			account.defaultListId = listId;
+		});
+
+		if (!account.excludeProjectTasks) {
+			const projectTasks = new Setting(body)
+				.setName("Project tasks")
+				.setDesc(
+					"Where tasks go that belong to a project, directly or as a subtask, whatever their tags. On the server their title starts with the project: “House | Fix the roof”."
+				);
+			this.listDropdown(projectTasks, account, unrouted, "Route by tags", account.projectListId, (listId) => {
+				account.projectListId = listId;
 			});
+		}
 
 		const never = new Setting(body).setName("Never sync");
 		this.renderChips(never.descEl, account.excludeTags, "Tasks with any of these tags are not picked up.", TAG_CHIPS, (tags) => {
 			account.excludeTags = tags;
 			this.save();
+		});
+
+		new Setting(body)
+			.setName("Never sync project tasks")
+			.setDesc(
+				"Tasks that belong to a project, directly or as a subtask, are not picked up. A synced task that joins a project is deleted from the server and unlinked."
+			)
+			.addToggle((toggle) =>
+				toggle.setValue(account.excludeProjectTasks).onChange((value) => {
+					account.excludeProjectTasks = value;
+					this.save();
+					this.display();
+				})
+			);
+	}
+
+	/** The account's lists, plus discovered ones not routed yet; choosing one of those adds it. */
+	private listDropdown(
+		setting: Setting,
+		account: CalDavAccountSettings,
+		unrouted: readonly CalDavCollectionInfo[],
+		emptyLabel: string,
+		value: string,
+		onChange: (listId: string) => void
+	): void {
+		setting.addDropdown((dropdown) => {
+			dropdown.addOption("", emptyLabel);
+			for (const list of account.lists) dropdown.addOption(list.id, list.name || list.url);
+			for (const collection of unrouted) dropdown.addOption(collection.url, collection.displayName);
+			dropdown.setValue(value).onChange((chosen) => {
+				onChange(account.lists.some((list) => list.id === chosen) ? chosen : chosen && this.addList(account, chosen).id);
+				this.save();
+				this.display();
+			});
 		});
 	}
 
@@ -377,7 +413,6 @@ export class CalDavSettingTab extends PluginSettingTab {
 			url,
 			name: collection?.displayName ?? "",
 			tags: [],
-			projects: [],
 			initialSyncCompleted: false,
 		};
 		account.lists.push(list);
@@ -426,20 +461,6 @@ export class CalDavSettingTab extends PluginSettingTab {
 			};
 		};
 		render();
-	}
-
-	private projectChips(): ChipKind {
-		return {
-			placeholder: "Add project, press Enter",
-			display: (path) => this.app.vault.getFileByPath(path)?.basename ?? path,
-			parse: (input) => {
-				const linkpath = input.trim().replace(/^\[\[|\]\]$/gu, "");
-				const file = this.app.metadataCache.getFirstLinkpathDest(linkpath, "");
-				if (file) return file.path;
-				new Notice(`There is no note "${linkpath}" in this vault.`);
-				return undefined;
-			},
-		};
 	}
 
 	private folderChips(): ChipKind {

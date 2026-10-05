@@ -21,8 +21,6 @@ export interface CalDavTaskList {
 	name: string;
 	/** Tasks with any of these tags go here; nested tags (`work/client`) match `work`. */
 	tags: string[];
-	/** Vault paths of project notes; tasks linked to one, directly or through a parent task, go here. */
-	projects: string[];
 	/** Set once the user has confirmed the first-sync preview for this list. */
 	initialSyncCompleted: boolean;
 }
@@ -44,6 +42,10 @@ export interface CalDavAccountSettings {
 	lists: CalDavTaskList[];
 	/** Where tasks matching no list's tags go; empty means they are not synced. */
 	defaultListId: string;
+	/** Where tasks belonging to a project go, ahead of their tags; empty routes them by tag. */
+	projectListId: string;
+	/** Tasks belonging to a project are not synced, and synced ones are taken off the server. */
+	excludeProjectTasks: boolean;
 	/** Tasks with any of these tags are never picked up. */
 	excludeTags: string[];
 	/** Only tasks inside one of these folders sync; empty means no folder restriction. */
@@ -85,6 +87,8 @@ export const DEFAULT_ACCOUNT: Omit<CalDavAccountSettings, "id"> = {
 	syncIntervalMinutes: 15,
 	lists: [],
 	defaultListId: "",
+	projectListId: "",
+	excludeProjectTasks: false,
 	excludeTags: [],
 	includeFolders: [],
 	excludeFolders: [],
@@ -111,18 +115,28 @@ interface LegacyAccountFields {
 	scopeFolder?: string; // before 0.5.0
 }
 
+/** Before 0.6.0 every list routed its own project notes. */
+interface LegacyListFields {
+	projects?: string[];
+}
+
 /**
  * A pre-0.4.0 account becomes an account with one list whose id is the old
  * account id, so the `caldav_account` stamped into notes and the sync state
  * keyed by it stay valid. An include filter becomes that list's routing tags;
  * otherwise the list takes everything else and an exclude filter stays one.
+ * Before 0.6.0, the first list that routed by project becomes the project list.
  */
 function migrateAccount(saved: Partial<CalDavAccountSettings> & LegacyAccountFields): CalDavAccountSettings {
 	const { collectionUrl, scopeTag, scopeTags, scopeTagMode, initialSyncCompleted, scopeFolder, ...account } = saved;
 	const merged = { ...DEFAULT_ACCOUNT, ...account } as CalDavAccountSettings;
 	const folder = scopeFolder?.trim().replace(/^\/+|\/+$/gu, "");
 	if (folder && !saved.includeFolders) merged.includeFolders = [folder];
-	merged.lists = merged.lists.map((list) => ({ ...list, projects: list.projects ?? [] }));
+	const lists = merged.lists as (CalDavTaskList & LegacyListFields)[];
+	if (saved.projectListId === undefined) {
+		merged.projectListId = lists.find((list) => (list.projects ?? []).length > 0)?.id ?? "";
+	}
+	merged.lists = lists.map(({ projects, ...list }) => list);
 	if (saved.lists || !collectionUrl) return merged;
 
 	const tags = scopeTags ?? (scopeTag?.trim() ? [scopeTag.trim()] : []);
@@ -133,7 +147,6 @@ function migrateAccount(saved: Partial<CalDavAccountSettings> & LegacyAccountFie
 			url: collectionUrl,
 			name: "",
 			tags: routed ? tags : [],
-			projects: [],
 			initialSyncCompleted: initialSyncCompleted ?? false,
 		},
 	];
@@ -143,9 +156,8 @@ function migrateAccount(saved: Partial<CalDavAccountSettings> & LegacyAccountFie
 }
 
 /**
- * Points folder filters and project routes at a renamed note or folder, so a
- * rename in the vault does not silently stop tasks from routing. Returns
- * whether anything changed.
+ * Points folder filters at a renamed folder, so a rename in the vault does not
+ * silently stop tasks from syncing. Returns whether anything changed.
  */
 export function followRename(settings: CalDavSettings, oldPath: string, newPath: string): boolean {
 	let changed = false;
@@ -159,7 +171,6 @@ export function followRename(settings: CalDavSettings, oldPath: string, newPath:
 	for (const account of settings.accounts) {
 		account.includeFolders = follow(account.includeFolders);
 		account.excludeFolders = follow(account.excludeFolders);
-		for (const list of account.lists) list.projects = follow(list.projects);
 	}
 	return changed;
 }

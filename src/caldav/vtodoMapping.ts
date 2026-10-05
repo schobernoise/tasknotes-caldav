@@ -8,7 +8,7 @@
  *
  * Fields deliberately NOT mapped, and preserved verbatim instead (see
  * vtodoDocument.ts): DESCRIPTION (the note body is not synced), VALARM,
- * RELATED-TO, ATTACH and every X- property.
+ * RELATED-TO, ATTACH and every X- property except X-TASKNOTES-PROJECTS.
  *
  * Pure: no Obsidian runtime, no network, no DOM or timer globals.
  */
@@ -233,6 +233,38 @@ function isPriorityNumber(value: number): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Projects
+// ---------------------------------------------------------------------------
+
+/** The names of a task's projects. Task apps do not show it; the title prefix is what they show. */
+const PROJECTS_PROPERTY = "X-TASKNOTES-PROJECTS";
+/**
+ * Between the first project and the title in SUMMARY. Splitting on the first
+ * one is safe because Obsidian file names, and so project names, cannot
+ * contain `|`.
+ */
+const PROJECT_SEPARATOR = " | ";
+
+/** Splits a "Project | title" SUMMARY, or undefined when it has no prefix. */
+export function parseProjectPrefix(summary: string): { project: string; title: string } | undefined {
+	const at = summary.indexOf(PROJECT_SEPARATOR);
+	if (at === -1) return undefined;
+	const project = summary.slice(0, at).trim();
+	const title = summary.slice(at + PROJECT_SEPARATOR.length).trim();
+	return project && title ? { project, title } : undefined;
+}
+
+/**
+ * True when the server's project names or title prefix differ from what the
+ * task's projects give, as after an upgrade or a prefix edited on a phone.
+ */
+export function hasStaleProjects(doc: VTodoDocument, projects: readonly string[]): boolean {
+	const summary = getTextProperty(doc, "SUMMARY") ?? "";
+	const prefixed = projects.length === 0 || summary.startsWith(`${projects[0]}${PROJECT_SEPARATOR}`);
+	return !prefixed || JSON.stringify(getTextListProperty(doc, PROJECTS_PROPERTY)) !== JSON.stringify(projects);
+}
+
+// ---------------------------------------------------------------------------
 // Recurrence
 // ---------------------------------------------------------------------------
 
@@ -265,17 +297,22 @@ export function joinRecurrence(dtstartCompact: string | undefined, rule: string)
 /**
  * Patches the fields TaskNotes owns onto an existing VTODO, leaving every other
  * line — including VALARM blocks and X- properties — untouched.
+ *
+ * `projects` are the names of the task's own project notes; the first one
+ * prefixes the title on the server.
  */
 export function applyTaskToVTodo(
 	doc: VTodoDocument,
 	task: TaskInfo,
 	context: VTodoMappingContext,
-	options: { uid: string; now?: string }
+	options: { uid: string; now?: string; projects?: readonly string[] }
 ): void {
 	const now = options.now ?? new Date().toISOString();
+	const projects = options.projects ?? [];
 
 	setTextProperty(doc, "UID", options.uid);
-	setTextProperty(doc, "SUMMARY", task.title ?? "");
+	setTextProperty(doc, "SUMMARY", projects.length > 0 ? `${projects[0]}${PROJECT_SEPARATOR}${task.title ?? ""}` : (task.title ?? ""));
+	setTextListProperty(doc, PROJECTS_PROPERTY, [...projects]);
 
 	const recurrence = task.recurrence ? splitRecurrence(task.recurrence) : undefined;
 	// DTSTART doubles as the recurrence anchor, so a recurring task falls back to
@@ -415,8 +452,12 @@ export function readVTodoIntoTaskPatch(
 ): VTodoTaskPatch {
 	const patch: VTodoTaskPatch = {};
 
+	// The prefix is only stripped where the plugin wrote one; a title typed on
+	// a phone is taken as it is.
 	const summary = getTextProperty(doc, "SUMMARY");
-	if (summary !== undefined) patch.title = summary;
+	if (summary !== undefined) {
+		patch.title = getProperty(doc, PROJECTS_PROPERTY) ? (parseProjectPrefix(summary)?.title ?? summary) : summary;
+	}
 
 	patch.due = readDate(doc, "DUE", context) ?? null;
 

@@ -13,7 +13,7 @@ describe("mergeSettings", () => {
 			accounts: [{ id: "a", collectionUrl: "https://dav/personal/", scopeTags: [], scopeTagMode: "include", initialSyncCompleted: true } as never],
 		}).accounts;
 		expect(account.lists).toEqual([
-			{ id: "a", url: "https://dav/personal/", name: "", tags: [], projects: [], initialSyncCompleted: true },
+			{ id: "a", url: "https://dav/personal/", name: "", tags: [], initialSyncCompleted: true },
 		]);
 		expect(account).toMatchObject({ defaultListId: "a", excludeTags: [] });
 		expect(account).not.toHaveProperty("collectionUrl");
@@ -62,13 +62,28 @@ describe("mergeSettings", () => {
 		expect(account.includeFolders).toEqual([]);
 	});
 
-	it("keeps a 0.4.0 account as it is, its lists routing by no project yet", () => {
+	it("keeps a 0.4.0 account as it is, with no project list", () => {
 		const list = { id: "l", url: "u", name: "Work", tags: ["work"], initialSyncCompleted: true };
-		const saved = { ...DEFAULT_ACCOUNT, id: "a", lists: [list], defaultListId: "", excludeTags: ["x"] };
+		const { projectListId, excludeProjectTasks, ...pre06 } = DEFAULT_ACCOUNT;
+		const saved = { ...pre06, id: "a", lists: [list], defaultListId: "", excludeTags: ["x"] };
 		expect(mergeSettings({ accounts: [saved as never] }).accounts[0]).toEqual({
+			...DEFAULT_ACCOUNT,
 			...saved,
-			lists: [{ ...list, projects: [] }],
 		});
+	});
+
+	it("makes the first 0.5 list that routed by project the project list, and drops per-list projects", () => {
+		const list = (id: string, projects: string[]) => ({ id, url: id, name: "", tags: [], projects, initialSyncCompleted: true });
+		const lists = [list("w", []), list("b", ["Projects/Band.md"]), list("h", ["Projects/House.md"])];
+		const [account] = mergeSettings({ accounts: [{ id: "a", lists } as never] }).accounts;
+		expect(account.projectListId).toBe("b");
+		expect(account.lists.some((migrated) => "projects" in migrated)).toBe(false);
+	});
+
+	it("keeps a project list choice once one was saved", () => {
+		const lists = [{ id: "b", url: "b", name: "", tags: [], projects: ["Projects/Band.md"], initialSyncCompleted: true }];
+		const [account] = mergeSettings({ accounts: [{ id: "a", lists, projectListId: "" } as never] }).accounts;
+		expect(account.projectListId).toBe("");
 	});
 });
 
@@ -81,23 +96,14 @@ describe("followRename", () => {
 					id: "a",
 					includeFolders: ["Tasks", "Tasks2"],
 					excludeFolders: ["Tasks/Old"],
-					lists: [{ id: "l", url: "u", name: "", tags: [], projects: ["Projects/Band.md", "Projects/Bandit.md"], initialSyncCompleted: true }],
 				},
 			],
 		});
 
-	it("follows a renamed project note", () => {
-		const renamed = settings();
-		expect(followRename(renamed, "Projects/Band.md", "Projects/Old band.md")).toBe(true);
-		expect(renamed.accounts[0].lists[0].projects).toEqual(["Projects/Old band.md", "Projects/Bandit.md"]);
-	});
-
-	it("follows a renamed folder into folder filters and the projects inside it", () => {
+	it("follows a renamed folder into folder filters, leaving name-prefixed folders alone", () => {
 		const renamed = settings();
 		expect(followRename(renamed, "Tasks", "Todo")).toBe(true);
 		expect(renamed.accounts[0]).toMatchObject({ includeFolders: ["Todo", "Tasks2"], excludeFolders: ["Todo/Old"] });
-		followRename(renamed, "Projects", "Areas");
-		expect(renamed.accounts[0].lists[0].projects).toEqual(["Areas/Band.md", "Areas/Bandit.md"]);
 	});
 
 	it("reports nothing changed for an unrelated rename", () => {

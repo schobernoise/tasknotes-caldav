@@ -5,8 +5,10 @@ import {
 	changedFields,
 	defaultPriorityScale,
 	hasStalePriority,
+	hasStaleProjects,
 	joinRecurrence,
 	mergeRemoteTags,
+	parseProjectPrefix,
 	priorityScale,
 	reconcileStartAndDue,
 	readVTodoIntoTaskPatch,
@@ -565,5 +567,62 @@ describe("pull round trip", () => {
 		expect(changedFields(readVTodoIntoTaskPatch(remote, context), own)).toEqual({
 			title: "Edited on the phone",
 		});
+	});
+});
+
+describe("projects", () => {
+	const task = makeTask({ title: "Fix the roof" });
+	const encode = (projects?: string[]) => {
+		const doc = createVTodoDocument();
+		applyTaskToVTodo(doc, task, context, { uid: "u", projects });
+		return doc;
+	};
+
+	it("prefixes the title with the first project and lists every project", () => {
+		const doc = encode(["House", "Garden, front"]);
+		expect(getTextProperty(doc, "SUMMARY")).toBe("House | Fix the roof");
+		expect(getProperty(doc, "X-TASKNOTES-PROJECTS")?.value).toBe("House,Garden\\, front");
+	});
+
+	it("drops prefix and property once the task has no project", () => {
+		const doc = encode(["House"]);
+		applyTaskToVTodo(doc, task, context, { uid: "u", projects: [] });
+		expect(getTextProperty(doc, "SUMMARY")).toBe("Fix the roof");
+		expect(getProperty(doc, "X-TASKNOTES-PROJECTS")).toBeUndefined();
+	});
+
+	it("strips the prefix it wrote, even one edited on a phone, but not a title typed with a pipe", () => {
+		const doc = encode(["House"]);
+		expect(readVTodoIntoTaskPatch(doc, context).title).toBe("Fix the roof");
+		setTextProperty(doc, "SUMMARY", "Garden | Fix the roof");
+		expect(readVTodoIntoTaskPatch(doc, context).title).toBe("Fix the roof");
+		const typed = encode();
+		setTextProperty(typed, "SUMMARY", "Haus | Dach");
+		expect(readVTodoIntoTaskPatch(typed, context).title).toBe("Haus | Dach");
+	});
+
+	it("reads back as an unchanged title", () => {
+		const own = readVTodoIntoTaskPatch(encode(), context);
+		expect(changedFields(readVTodoIntoTaskPatch(encode(["House"]), context), own)).toEqual({});
+	});
+
+	it("splits a prefix at the first separator only", () => {
+		expect(parseProjectPrefix("House | Fix the roof")).toEqual({ project: "House", title: "Fix the roof" });
+		expect(parseProjectPrefix("House | a | b")).toEqual({ project: "House", title: "a | b" });
+		expect(parseProjectPrefix("Fix the roof")).toBeUndefined();
+		expect(parseProjectPrefix("a|b")).toBeUndefined();
+		expect(parseProjectPrefix(" | Fix")).toBeUndefined();
+		expect(parseProjectPrefix("House | ")).toBeUndefined();
+	});
+
+	it("spots a missing prefix or outdated project names", () => {
+		expect(hasStaleProjects(encode(["House"]), ["House"])).toBe(false);
+		expect(hasStaleProjects(encode(), [])).toBe(false);
+		expect(hasStaleProjects(encode(), ["House"])).toBe(true);
+		expect(hasStaleProjects(encode(["House"]), [])).toBe(true);
+		expect(hasStaleProjects(encode(["House"]), ["House", "Garden"])).toBe(true);
+		const edited = encode(["House"]);
+		setTextProperty(edited, "SUMMARY", "Fix the roof");
+		expect(hasStaleProjects(edited, ["House"])).toBe(true);
 	});
 });

@@ -37,8 +37,9 @@ import {
 	type RemoteTodoSnapshot,
 } from "./caldav/caldavReconciliation";
 import {
-	inExcludedFolder,
+	projectListId,
 	rehomeForList,
+	releasesTask,
 	routeTask,
 	type AccountRouting,
 	type ProjectLink,
@@ -48,7 +49,9 @@ import {
 	applyTaskToVTodo,
 	changedFields,
 	hasStalePriority,
+	hasStaleProjects,
 	mergeRemoteTags,
+	parseProjectPrefix,
 	priorityScale,
 	readVTodoIntoTaskPatch,
 	readVTodoRevision,
@@ -273,14 +276,12 @@ export class CalDavSyncService {
 		const fingerprint = getCalDavRelevantFingerprint(task);
 		if (this.state.fingerprints[path] === fingerprint) return; // nothing sync-relevant changed
 
-		if (!(await this.routeTarget(task)) || !this.settings.pushOnChange) {
-			// Out of scope, or waiting for the poll: remember the fingerprint so
-			// we do not re-evaluate it on every keystroke.
-			await this.recordFingerprint(path, fingerprint);
-			return;
-		}
-
-		this.schedulePush(path);
+		// The fingerprint is only recorded once the edit reached the server. An
+		// edit recorded without being pushed would look synced: a poll would
+		// never send it, and a task that routed nowhere at the time would stay
+		// off the server after the settings bring it into scope. Routing waits
+		// for the debounced push, so it is not re-evaluated on every keystroke.
+		if (this.settings.pushOnChange) this.schedulePush(path);
 	}
 
 	/** Deletes the remote VTODO when its task file is removed from the vault. */
@@ -336,11 +337,11 @@ export class CalDavSyncService {
 		await this.pushTask(path);
 	}
 
-	/** Pushes a task to the list its tags route it to, moving it there if it lives elsewhere. */
+	/** Pushes a task to the list it routes to, moving it there if it lives elsewhere. */
 	async pushTask(path: string): Promise<void> {
 		if (this.destroyed) return;
-		const excluded = this.excludedLink(path);
-		if (excluded) return this.releaseTask(excluded, path);
+		const released = await this.releasedLink(path);
+		if (released) return this.releaseTask(released, path);
 		const task = await this.api.tasks.get(path);
 		const target = task ? await this.routeTarget(task) : undefined;
 		// A list waiting for its first sync uploads its tasks during that sync.
@@ -376,7 +377,7 @@ export class CalDavSyncService {
 		href ??= joinUrl(target.list.url, `${uid}.ics`);
 
 		const doc = (existingData ? parseVTodoDocument(existingData) : null) ?? createVTodoDocument();
-		applyTaskToVTodo(doc, task, this.mappingContext(target), { uid });
+		applyTaskToVTodo(doc, task, this.mappingContext(target), { uid, projects: await this.projectNames(task) });
 		const relations = await this.resolveOutboundRelations(task);
 		applyRelations(doc, relations.relations);
 		applyReminders(doc, task.reminders ?? []);
@@ -492,6 +493,7 @@ export class CalDavSyncService {
 		if (winner === "local") {
 			applyTaskToVTodo(remoteDoc, task, this.mappingContext(target), {
 				uid: readVTodoUid(remoteDoc) ?? generateUid(),
+				projects: await this.projectNames(task),
 			});
 			const retry = await client.putResource(href, serializeVTodoDocument(remoteDoc), {
 				ifMatch: current.etag,
@@ -642,7 +644,7 @@ export class CalDavSyncService {
 		const locals: LocalTaskSnapshot[] = [];
 		for (const local of await this.snapshotListTasks(target)) {
 			if (skipPaths.has(local.path)) continue;
-			if (local.uid && this.excludedLink(local.path)) {
+			if (local.uid && (await this.releasedLink(local.path))) {
 				released.add(local.uid);
 				await this.isolate(failures, local.path, () => this.releaseTask(target, local.path));
 				continue;
@@ -658,7 +660,8 @@ export class CalDavSyncService {
 		// Linked here but now routed elsewhere, e.g. after its list's tags were
 		// edited in settings: pushing moves it. Likewise a task the server still
 		// holds under an older priority scale, which would otherwise read back
-		// as a different priority on its next pull.
+		// as a different priority on its next pull, or without its current
+		// project prefix.
 		const planned = new Set(
 			[...plan.toPush, ...plan.remoteDeleted, ...plan.conflicts.map((conflict) => conflict.local)].map(
 				(local) => local.path
@@ -672,9 +675,12 @@ export class CalDavSyncService {
 			if (!task) continue;
 			const routed = await this.routeTarget(task);
 			const remote = remotesByUid.get(local.uid);
-			const stalePriority =
-				rescaled && remote?.etag === local.etag && this.holdsStalePriority(target, task, remote);
-			if ((routed && routed.list.id !== target.list.id) || stalePriority) plan.toPush.push(local);
+			const held = remote && remote.etag === local.etag ? parseVTodoDocument(remote.data) : null;
+			const stale =
+				held !== null &&
+				((rescaled && hasStalePriority(held, task, this.mappingContext(target))) ||
+					hasStaleProjects(held, await this.projectNames(task)));
+			if ((routed && routed.list.id !== target.list.id) || stale) plan.toPush.push(local);
 		}
 
 		for (const remote of plan.toPull) {
@@ -740,19 +746,26 @@ export class CalDavSyncService {
 				this.protectedTags(target.list)
 			);
 			if (movedFrom) {
+				const projectList = projectListId(routingFor(target.account));
+				const projectTask = (await this.projectAncestry(local)).length > 0;
+				const named =
+					target.list.id === projectList && !projectTask
+						? await this.projectFromPrefix(updates.title ?? local.title, path)
+						: undefined;
+				if (named) {
+					updates.title = named.title;
+					updates.projects = [...(local.projects ?? []), named.link];
+				}
 				const rehomed = rehomeForList(
-					{
-						tags: updates.tags ?? local.tags ?? [],
-						projects: this.projectLinks(local),
-						projectPaths: await this.projectAncestry(local),
-					},
+					{ tags: updates.tags ?? local.tags ?? [], projectTask: projectTask || named !== undefined },
 					routeOf(movedFrom),
 					routeOf(target.list),
-					(project) => this.wikilinkTo(project, path)
+					projectList
 				);
 				updates.tags = rehomed.tags;
-				if (JSON.stringify(rehomed.projects) !== JSON.stringify(local.projects ?? [])) {
-					updates.projects = rehomed.projects;
+				if (rehomed.dropProjects) {
+					const plain = (await this.plainProjectLinks(local)).map((project) => project.link);
+					updates.projects = (local.projects ?? []).filter((link) => !plain.includes(link));
 				}
 			}
 			// A title change renames the note when TaskNotes stores titles in
@@ -783,17 +796,20 @@ export class CalDavSyncService {
 		}
 
 		// New on the server: create through TaskNotes so folder rules, templates
-		// and defaults all apply. It takes its list's tag or project, so routing
-		// keeps it there.
-		const { tags, projects } = rehomeForList(
-			{ tags: mergeRemoteTags(patch.tags ?? [], this.taskTags(), this.taskTags()), projects: [], projectPaths: [] },
+		// and defaults all apply. It takes its list's tag, or in the project
+		// list the project its title names, so routing keeps it there.
+		const projectList = projectListId(routingFor(target.account));
+		const named =
+			target.list.id === projectList ? await this.projectFromPrefix(patch.title ?? "", "") : undefined;
+		const { tags } = rehomeForList(
+			{ tags: mergeRemoteTags(patch.tags ?? [], this.taskTags(), this.taskTags()), projectTask: named !== undefined },
 			undefined,
 			routeOf(target.list),
-			(project) => this.wikilinkTo(project, "")
+			projectList
 		);
 		const created = await this.api.tasks.create(
 			{
-				title: patch.title ?? "Untitled task",
+				title: named?.title ?? patch.title ?? "Untitled task",
 				...(patch.status !== undefined && { status: patch.status }),
 				...(patch.priority !== undefined && { priority: patch.priority }),
 				// Empty string rather than an omitted key: leaving a date out lets the
@@ -806,7 +822,7 @@ export class CalDavSyncService {
 				completedDate: patch.completedDate ?? "",
 				recurrence: patch.recurrence ?? "",
 				...(tags.length ? { tags } : {}),
-				...(projects.length ? { projects } : {}),
+				...(named ? { projects: [named.link] } : {}),
 				creationContext: "import",
 				// The CalDAV keys are not TaskNotes fields, so they travel as
 				// custom frontmatter and land in the file in the same write.
@@ -900,28 +916,37 @@ export class CalDavSyncService {
 		return unlinked;
 	}
 
-	/** Removes a task's CalDAV link, leaving the note and the server copy alone. */
-	/** The list a task is linked to, when the note now sits in one of that account's never-sync folders. */
-	private excludedLink(path: string): SyncTarget | undefined {
+	/**
+	 * The list a task is linked to, when the task has to leave it: its note sits
+	 * in one of that account's never-sync folders, or it belongs to a project
+	 * while the account does not sync project tasks.
+	 */
+	private async releasedLink(path: string): Promise<SyncTarget | undefined> {
 		const linked = this.findTarget(this.listIdAt(path));
-		return linked && inExcludedFolder(path, routingFor(linked.account)) ? linked : undefined;
+		if (!linked) return undefined;
+		const task = await this.api.tasks.get(path);
+		const projectPaths = task ? await this.projectAncestry(task) : [];
+		return releasesTask(path, routingFor(linked.account), projectPaths) ? linked : undefined;
 	}
 
 	/**
-	 * Takes a task out of sync after its note moved into a never-sync folder.
-	 * The server copy is deleted rather than left behind, because an unlinked
-	 * copy would come back as a new note on the next poll. The note keeps
-	 * everything except its caldav_* keys.
+	 * Takes a task out of sync after its note moved into a never-sync folder or
+	 * joined a project that is not synced. The server copy is deleted rather
+	 * than left behind, because an unlinked copy would come back as a new note
+	 * on the next poll. The note keeps everything except its caldav_* keys.
+	 *
+	 * Forgotten rather than unlinked: the exclusion is what keeps it off the
+	 * server, so once that is lifted the task uploads again.
 	 */
 	private async releaseTask(target: SyncTarget, path: string): Promise<void> {
 		const href = asString(this.readFrontmatterAt(path)?.[CALDAV_FRONTMATTER_KEYS.href]);
 		if (href) await this.createClient(target.account).deleteResource(href);
-		await this.unlinkTask(path);
-		this.state.resourceIndex = this.state.resourceIndex.filter((entry) => entry.path !== path);
-		await this.plugin.saveState();
-		this.logger.info("Stopped syncing a task in a never-sync folder", { details: { path } });
+		await this.clearSyncMetadata(path);
+		await this.forgetTask(path);
+		this.logger.info("Stopped syncing a task that is excluded now", { details: { path } });
 	}
 
+	/** Removes a task's CalDAV link, leaving the note and the server copy alone. */
 	private async unlinkTask(path: string): Promise<void> {
 		await this.clearSyncMetadata(path);
 
@@ -948,6 +973,7 @@ export class CalDavSyncService {
 			...account,
 			lists: remaining,
 			defaultListId: account.defaultListId === listId ? "" : account.defaultListId,
+			projectListId: account.projectListId === listId ? "" : account.projectListId,
 		});
 		const failures: SyncFailure[] = [];
 
@@ -963,6 +989,7 @@ export class CalDavSyncService {
 		if (failures.length === 0) {
 			account.lists = remaining;
 			if (account.defaultListId === listId) account.defaultListId = "";
+			if (account.projectListId === listId) account.projectListId = "";
 			delete this.state.collectionState[listId];
 			await this.plugin.saveSettings();
 		}
@@ -1215,44 +1242,66 @@ export class CalDavSyncService {
 		return `[[${this.plugin.app.metadataCache.fileToLinktext(target, sourcePath, true)}]]`;
 	}
 
-	private wikilinkTo(path: string, sourcePath: string): string {
-		const file = this.getFile(path);
-		return file ? this.wikilink(file, sourcePath) : `[[${path.replace(/\.md$/u, "")}]]`;
-	}
-
 	/** A task's `projects` links with the notes they resolve to. */
 	private projectLinks(task: TaskInfo): ProjectLink[] {
-		return (task.projects ?? []).map((link) => ({ link, path: this.resolveLink(link, task.path) }));
+		return (task.projects ?? [])
+			.filter((link) => linkpathOf(link))
+			.map((link) => ({ link, path: this.plugin.app.metadataCache.getFirstLinkpathDest(linkpathOf(link), task.path)?.path }));
 	}
 
-	private resolveLink(link: string, sourcePath: string): string | undefined {
-		const linkpath = link.replace(/^\[\[|\]\]$/gu, "").split("|")[0].split("#")[0].trim();
-		return this.plugin.app.metadataCache.getFirstLinkpathDest(linkpath, sourcePath)?.path;
+	/** A task's links to project notes rather than parent tasks. A link to no note at all names a project too. */
+	private async plainProjectLinks(task: TaskInfo): Promise<ProjectLink[]> {
+		const plain: ProjectLink[] = [];
+		for (const project of this.projectLinks(task)) {
+			if (!project.path || !(await this.api.tasks.get(project.path))) plain.push(project);
+		}
+		return plain;
+	}
+
+	/** Names of the project notes a task links itself, for the server's title prefix. */
+	private async projectNames(task: TaskInfo): Promise<string[]> {
+		return (await this.plainProjectLinks(task)).map(
+			({ link, path }) => (path && this.getFile(path)?.basename) || linkpathOf(link).split("/").pop() || link
+		);
 	}
 
 	/**
-	 * The project notes a task belongs to: those it links, and, where those are
-	 * tasks themselves, the ones they link in turn. Skipped entirely while no
-	 * list routes by project, since it costs a lookup per ancestor.
+	 * The project notes a task belongs to: those it links, and those its parent
+	 * tasks link, however deep. Unresolved links count by their text. Skipped
+	 * entirely while no account treats project tasks specially, since it costs
+	 * a lookup per ancestor.
 	 */
 	private async projectAncestry(task: TaskInfo): Promise<string[]> {
-		if (!this.settings.accounts.some((account) => account.lists.some((list) => list.projects.length > 0))) return [];
+		if (!this.settings.accounts.some((account) => account.excludeProjectTasks || account.projectListId)) return [];
+		const projects = new Set<string>();
 		const seen = new Set([task.path]);
 		let level = [task];
 		while (level.length > 0) {
 			const next: TaskInfo[] = [];
 			for (const current of level) {
-				for (const { path } of this.projectLinks(current)) {
-					if (!path || seen.has(path)) continue;
-					seen.add(path);
-					const parent = await this.api.tasks.get(path);
+				for (const { link, path } of this.projectLinks(current)) {
+					const key = path ?? link;
+					if (seen.has(key)) continue;
+					seen.add(key);
+					const parent = path ? await this.api.tasks.get(path) : null;
 					if (parent) next.push(parent);
+					else projects.add(key);
 				}
 			}
 			level = next;
 		}
-		seen.delete(task.path);
-		return [...seen];
+		return [...projects];
+	}
+
+	/**
+	 * The project a "Project | title" names, for a task arriving in the project
+	 * list without one: linked only when it is an existing note that is not a task.
+	 */
+	private async projectFromPrefix(title: string, sourcePath: string): Promise<{ title: string; link: string } | undefined> {
+		const parsed = parseProjectPrefix(title);
+		const file = parsed ? this.plugin.app.metadataCache.getFirstLinkpathDest(parsed.project, sourcePath) : null;
+		if (!parsed || !file || (await this.api.tasks.get(file.path))) return undefined;
+		return { title: parsed.title, link: this.wikilink(file, sourcePath) };
 	}
 
 	/** Applies the configured policy when a VTODO disappears from the server. */
@@ -1296,11 +1345,15 @@ export class CalDavSyncService {
 		if (!account) throw new Error(`Unknown CalDAV account ${accountId}`);
 		const pending = account.lists.filter((list) => !list.initialSyncCompleted);
 		for (const list of pending) {
-			// Imports into it would carry no tag or project, and the next poll
-			// would route them off to the default list.
-			if (list.tags.length === 0 && list.projects.length === 0 && list.id !== account.defaultListId) {
+			// Imports into it would carry no tag, and the next poll would route
+			// them off to the default list.
+			if (
+				list.tags.length === 0 &&
+				list.id !== account.defaultListId &&
+				list.id !== projectListId(routingFor(account))
+			) {
 				throw new Error(
-					`"${list.name || list.url}" has no tags or projects and is not the default list. Give it one first`
+					`"${list.name || list.url}" has no tags and is neither the default nor the project list. Give it a tag first`
 				);
 			}
 		}
@@ -1455,11 +1508,6 @@ export class CalDavSyncService {
 	/** Changes whenever the PRIORITY any task would be written with changes. */
 	private priorityScaleKey(): string {
 		return JSON.stringify([...priorityScale(this.priorities(), this.settings.priorityMap)]);
-	}
-
-	private holdsStalePriority(target: SyncTarget, task: TaskInfo, remote: RemoteSnapshotWithData | undefined): boolean {
-		const doc = remote ? parseVTodoDocument(remote.data) : null;
-		return doc !== null && hasStalePriority(doc, task, this.mappingContext(target));
 	}
 
 	/** Tags a phone app cannot remove from a note, because the server never shows them. */
@@ -1661,6 +1709,8 @@ function routingFor(account: CalDavAccountSettings): AccountRouting {
 	return {
 		lists: account.lists.map(routeOf),
 		defaultListId: account.defaultListId || undefined,
+		projectListId: account.projectListId || undefined,
+		excludeProjectTasks: account.excludeProjectTasks,
 		excludeTags: account.excludeTags,
 		includeFolders: account.includeFolders,
 		excludeFolders: account.excludeFolders,
@@ -1668,7 +1718,12 @@ function routingFor(account: CalDavAccountSettings): AccountRouting {
 }
 
 function routeOf(list: CalDavTaskList): TaskListRoute {
-	return { listId: list.id, tags: list.tags, projects: list.projects };
+	return { listId: list.id, tags: list.tags };
+}
+
+/** The target of a frontmatter link: `[[Folder/Note#Heading|Alias]]` gives `Folder/Note`. */
+function linkpathOf(link: string): string {
+	return link.replace(/^\[\[|\]\]$/gu, "").split("|")[0].split("#")[0].trim();
 }
 
 /**

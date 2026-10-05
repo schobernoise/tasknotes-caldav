@@ -6,7 +6,7 @@ import {
 	hasCalDavRelevantChange,
 	parseCalDavFingerprint,
 } from "../../src/caldav/caldavFingerprint";
-import { inExcludedFolder, rehomeForList, routeTask, type AccountRouting } from "../../src/caldav/collectionMembership";
+import { rehomeForList, releasesTask, routeTask, type AccountRouting } from "../../src/caldav/collectionMembership";
 
 function makeTask(overrides: Partial<TaskInfo> & Record<string, unknown> = {}): TaskInfo {
 	return {
@@ -104,12 +104,13 @@ describe("hasCalDavRelevantChange", () => {
 describe("routeTask", () => {
 	const routing: AccountRouting = {
 		lists: [
-			{ listId: "work", tags: ["#Work", "client"], projects: [] },
-			{ listId: "home", tags: ["home"], projects: ["Projects/House.md"] },
-			{ listId: "band", tags: [], projects: ["Projects/Band.md"] },
-			{ listId: "personal", tags: [], projects: [] },
+			{ listId: "work", tags: ["#Work", "client"] },
+			{ listId: "home", tags: ["home"] },
+			{ listId: "projects", tags: [] },
+			{ listId: "personal", tags: [] },
 		],
 		defaultListId: "personal",
+		projectListId: "projects",
 	};
 	const route = (
 		overrides: Partial<TaskInfo>,
@@ -195,26 +196,46 @@ describe("routeTask", () => {
 		expect(route({ archived: true, tags: ["work"] }, "work")).toBe("work");
 	});
 
-	it("sends a task belonging to a list's project there, however it got that project", () => {
+	it("sends a project task to the project list, however it got its project", () => {
 		// The service resolves links and parent tasks into these paths.
-		expect(route({}, undefined, {}, ["Projects/Band.md"])).toBe("band");
-		expect(route({ tags: ["urgent"] }, undefined, {}, ["Tasks/parent.md", "Projects/House.md"])).toBe("home");
-		expect(route({}, undefined, {}, ["Projects/Other.md"])).toBe("personal");
+		expect(route({}, undefined, {}, ["Projects/Band.md"])).toBe("projects");
+		expect(route({ tags: ["urgent"] }, undefined, {}, ["Projects/House.md"])).toBe("projects");
 	});
 
-	it("tries lists in order whether they match by tag or by project", () => {
-		expect(route({ tags: ["work"] }, undefined, {}, ["Projects/Band.md"])).toBe("work");
-		expect(route({ tags: ["home"] }, undefined, {}, ["Projects/Band.md"])).toBe("home");
+	it("puts the project list ahead of tags, even the tags of the list a task is in", () => {
+		expect(route({ tags: ["work"] }, undefined, {}, ["Projects/Band.md"])).toBe("projects");
+		expect(route({ tags: ["work"] }, "work", {}, ["Projects/Band.md"])).toBe("projects");
 	});
 
-	it("keeps a task in a project list while it belongs to the project, and moves it once it no longer does", () => {
-		expect(route({ tags: ["work"] }, "band", {}, ["Projects/Band.md"])).toBe("band");
-		expect(route({ tags: ["work"] }, "band")).toBe("work");
-		expect(route({}, "band")).toBe("personal");
+	it("routes project tasks by tag while there is no project list", () => {
+		expect(route({ tags: ["work"] }, undefined, { projectListId: undefined }, ["Projects/Band.md"])).toBe("work");
+		expect(route({}, undefined, { projectListId: undefined }, ["Projects/Band.md"])).toBe("personal");
 	});
 
-	it("does not let a default list hold a task a project list wants", () => {
-		expect(route({}, "personal", {}, ["Projects/Band.md"])).toBe("band");
+	it("moves a task that left its project out of a project list without tags", () => {
+		expect(route({ tags: ["work"] }, "projects")).toBe("work");
+		expect(route({}, "projects")).toBe("personal");
+		expect(route({}, "projects", { defaultListId: undefined })).toBe("projects");
+	});
+
+	it("lets a project list that is also the default keep everything else", () => {
+		const custom = { projectListId: "personal" };
+		expect(route({}, undefined, custom, ["Projects/Band.md"])).toBe("personal");
+		expect(route({}, "personal", custom)).toBe("personal");
+		expect(route({ tags: ["home"] }, "personal", custom)).toBe("home");
+	});
+
+	it("keeps a project list with tags holding tasks that have them", () => {
+		const custom = { lists: [...routing.lists.slice(0, 2), { listId: "projects", tags: ["gig"] }, routing.lists[3]] };
+		expect(route({ tags: ["gig"] }, "projects", custom)).toBe("projects");
+		expect(route({ tags: ["gig"] }, undefined, custom)).toBe("projects");
+	});
+
+	it("does not pick up project tasks while they are excluded, and ignores the project list then", () => {
+		const custom = { excludeProjectTasks: true };
+		expect(route({ tags: ["work"] }, undefined, custom, ["Projects/Band.md"])).toBeUndefined();
+		expect(route({ tags: ["work"] }, undefined, custom)).toBe("work");
+		expect(route({}, "projects", custom)).toBe("projects");
 	});
 
 	it("routes a task out of a removed list by its tags, ignoring exclusions since it is already on the server", () => {
@@ -223,35 +244,37 @@ describe("routeTask", () => {
 	});
 });
 
-describe("inExcludedFolder", () => {
+describe("releasesTask", () => {
 	const routing: AccountRouting = { lists: [], excludeFolders: ["/attachments/", "Tasks/Old"] };
 
-	it("finds notes in a never-sync folder or below it", () => {
-		expect(inExcludedFolder("attachments/templates/taskTemplate.md", routing)).toBe(true);
-		expect(inExcludedFolder("Tasks/Old/a.md", routing)).toBe(true);
+	it("releases notes in a never-sync folder or below it", () => {
+		expect(releasesTask("attachments/templates/taskTemplate.md", routing, [])).toBe(true);
+		expect(releasesTask("Tasks/Old/a.md", routing, [])).toBe(true);
 	});
 
 	it("ignores other folders, including ones that only share a name prefix", () => {
-		expect(inExcludedFolder("Tasks/a.md", routing)).toBe(false);
-		expect(inExcludedFolder("Tasks/Older/a.md", routing)).toBe(false);
-		expect(inExcludedFolder("attachments.md", routing)).toBe(false);
-		expect(inExcludedFolder("Tasks/a.md", { lists: [] })).toBe(false);
+		expect(releasesTask("Tasks/a.md", routing, [])).toBe(false);
+		expect(releasesTask("Tasks/Older/a.md", routing, [])).toBe(false);
+		expect(releasesTask("attachments.md", routing, [])).toBe(false);
+		expect(releasesTask("Tasks/a.md", { lists: [] }, [])).toBe(false);
+	});
+
+	it("releases project tasks only while project tasks are excluded", () => {
+		expect(releasesTask("Tasks/a.md", routing, ["Projects/Band.md"])).toBe(false);
+		expect(releasesTask("Tasks/a.md", { ...routing, excludeProjectTasks: true }, ["Projects/Band.md"])).toBe(true);
+		expect(releasesTask("Tasks/a.md", { ...routing, excludeProjectTasks: true }, [])).toBe(false);
 	});
 });
 
 describe("rehomeForList", () => {
-	const work = { listId: "work", tags: ["work", "client"], projects: [] };
-	const home = { listId: "home", tags: ["#home", "errand"], projects: [] };
-	const band = { listId: "band", tags: [], projects: ["Projects/Band.md", "Projects/Tour.md"] };
-	const personal = { listId: "personal", tags: [], projects: [] };
-	const linkTo = (path: string) => `[[${path.replace(/\.md$/u, "")}]]`;
-	const task = (tags: string[], projects: { link: string; path?: string }[] = [], projectPaths?: string[]) => ({
-		tags,
-		projects,
-		projectPaths: projectPaths ?? projects.flatMap((project) => (project.path ? [project.path] : [])),
-	});
-	const retag = (tags: string[], from: typeof work | undefined, to: typeof work) =>
-		rehomeForList(task(tags), from, to, linkTo).tags;
+	const work = { listId: "work", tags: ["work", "client"] };
+	const home = { listId: "home", tags: ["#home", "errand"] };
+	const projects = { listId: "projects", tags: [] };
+	const gigs = { listId: "projects", tags: ["gig"] };
+	const personal = { listId: "personal", tags: [] };
+	const rehome = (tags: string[], from: typeof work | undefined, to: typeof work, projectTask = false) =>
+		rehomeForList({ tags, projectTask }, from, to, "projects");
+	const retag = (tags: string[], from: typeof work | undefined, to: typeof work) => rehome(tags, from, to).tags;
 
 	it("swaps the old list's routing tags for the new list's first tag", () => {
 		expect(retag(["task", "Work", "urgent"], work, home)).toEqual(["task", "urgent", "home"]);
@@ -266,7 +289,7 @@ describe("rehomeForList", () => {
 		expect(retag(["home/garden"], undefined, home)).toEqual(["home/garden"]);
 	});
 
-	it("adds nothing for a list without tags or projects", () => {
+	it("adds nothing for a list without tags", () => {
 		expect(retag(["work", "urgent"], work, personal)).toEqual(["urgent"]);
 		expect(retag(["urgent"], undefined, personal)).toEqual(["urgent"]);
 	});
@@ -275,22 +298,15 @@ describe("rehomeForList", () => {
 		expect(retag([], undefined, work)).toEqual(["work"]);
 	});
 
-	it("links a task moved or imported into a project list to its first project", () => {
-		expect(rehomeForList(task(["work"]), work, band, linkTo)).toEqual({ tags: [], projects: ["[[Projects/Band]]"] });
-		expect(rehomeForList(task([]), undefined, band, linkTo).projects).toEqual(["[[Projects/Band]]"]);
+	it("tags a task moved into a tagged project list only when it has no project", () => {
+		expect(rehome([], work, gigs, true).tags).toEqual([]);
+		expect(rehome([], work, gigs, false).tags).toEqual(["gig"]);
 	});
 
-	it("adds no link when the task already belongs to one of the list's projects, even through a parent", () => {
-		const subtask = task([], [{ link: "[[Gig]]", path: "Tasks/Gig.md" }], ["Tasks/Gig.md", "Projects/Tour.md"]);
-		expect(rehomeForList(subtask, personal, band, linkTo).projects).toEqual(["[[Gig]]"]);
-	});
-
-	it("drops direct links to the old list's projects and keeps the rest", () => {
-		const linked = task([], [
-			{ link: "[[Band]]", path: "Projects/Band.md" },
-			{ link: "[[Other]]", path: "Projects/Other.md" },
-			{ link: "[[Missing]]" },
-		]);
-		expect(rehomeForList(linked, band, home, linkTo)).toEqual({ tags: ["home"], projects: ["[[Other]]", "[[Missing]]"] });
+	it("drops the projects of a task moved out of the project list, and only then", () => {
+		expect(rehome([], projects, home, true)).toEqual({ tags: ["home"], dropProjects: true });
+		expect(rehome([], home, projects, true).dropProjects).toBe(false);
+		expect(rehome([], work, home, true).dropProjects).toBe(false);
+		expect(rehome([], undefined, home, true).dropProjects).toBe(false);
 	});
 });
