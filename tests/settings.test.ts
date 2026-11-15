@@ -1,9 +1,10 @@
 import { DEFAULT_ACCOUNT, followRename, mergeSettings } from "../src/settings";
 
 describe("mergeSettings", () => {
-	it("fills in defaults, with the task tag not synced", () => {
+	it("fills in defaults, with the task tag not synced and project titles prefixed", () => {
 		const settings = mergeSettings(undefined);
 		expect(settings.syncTaskTag).toBe(false);
+		expect(settings.projectTitlePrefix).toBe(true);
 		expect(settings.accounts).toEqual([]);
 	});
 

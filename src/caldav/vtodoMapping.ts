@@ -55,6 +55,8 @@ export interface VTodoMappingContext {
 	hiddenTags?: readonly string[];
 	/** The user's PRIORITY (0-9) per TaskNotes priority, over the defaults. */
 	priorityMap?: Readonly<Record<string, number>>;
+	/** Write the first project in front of SUMMARY. Defaults to true. */
+	projectPrefix?: boolean;
 }
 
 /** The subset of a task that a remote VTODO can dictate. */
@@ -254,14 +256,38 @@ export function parseProjectPrefix(summary: string): { project: string; title: s
 	return project && title ? { project, title } : undefined;
 }
 
+function writesProjectPrefix(context: VTodoMappingContext): boolean {
+	return context.projectPrefix !== false;
+}
+
+/**
+ * The title a SUMMARY stands for. With the prefix on, whatever precedes the
+ * separator is taken for the prefix, even one edited on a phone. With it off,
+ * only the first listed project is, as left from before it was turned off,
+ * so a title that merely contains a pipe stays whole.
+ */
+function titleFromSummary(doc: VTodoDocument, summary: string, context: VTodoMappingContext): string {
+	if (!getProperty(doc, PROJECTS_PROPERTY)) return summary;
+	const parsed = parseProjectPrefix(summary);
+	if (!parsed) return summary;
+	if (writesProjectPrefix(context)) return parsed.title;
+	return parsed.project === getTextListProperty(doc, PROJECTS_PROPERTY)[0] ? parsed.title : summary;
+}
+
 /**
  * True when the server's project names or title prefix differ from what the
- * task's projects give, as after an upgrade or a prefix edited on a phone.
+ * task's projects give, as after an upgrade, a prefix edited on a phone, or
+ * the prefix being turned off.
  */
-export function hasStaleProjects(doc: VTodoDocument, projects: readonly string[]): boolean {
+export function hasStaleProjects(
+	doc: VTodoDocument,
+	projects: readonly string[],
+	context: VTodoMappingContext
+): boolean {
 	const summary = getTextProperty(doc, "SUMMARY") ?? "";
-	const prefixed = projects.length === 0 || summary.startsWith(`${projects[0]}${PROJECT_SEPARATOR}`);
-	return !prefixed || JSON.stringify(getTextListProperty(doc, PROJECTS_PROPERTY)) !== JSON.stringify(projects);
+	const prefixed = projects.length > 0 && summary.startsWith(`${projects[0]}${PROJECT_SEPARATOR}`);
+	const prefixAsWanted = projects.length === 0 || prefixed === writesProjectPrefix(context);
+	return !prefixAsWanted || JSON.stringify(getTextListProperty(doc, PROJECTS_PROPERTY)) !== JSON.stringify(projects);
 }
 
 // ---------------------------------------------------------------------------
@@ -299,7 +325,7 @@ export function joinRecurrence(dtstartCompact: string | undefined, rule: string)
  * line — including VALARM blocks and X- properties — untouched.
  *
  * `projects` are the names of the task's own project notes; the first one
- * prefixes the title on the server.
+ * prefixes the title on the server, unless the context turns that off.
  */
 export function applyTaskToVTodo(
 	doc: VTodoDocument,
@@ -311,7 +337,12 @@ export function applyTaskToVTodo(
 	const projects = options.projects ?? [];
 
 	setTextProperty(doc, "UID", options.uid);
-	setTextProperty(doc, "SUMMARY", projects.length > 0 ? `${projects[0]}${PROJECT_SEPARATOR}${task.title ?? ""}` : (task.title ?? ""));
+	const title = task.title ?? "";
+	setTextProperty(
+		doc,
+		"SUMMARY",
+		projects.length > 0 && writesProjectPrefix(context) ? `${projects[0]}${PROJECT_SEPARATOR}${title}` : title
+	);
 	setTextListProperty(doc, PROJECTS_PROPERTY, [...projects]);
 
 	const recurrence = task.recurrence ? splitRecurrence(task.recurrence) : undefined;
@@ -455,9 +486,7 @@ export function readVTodoIntoTaskPatch(
 	// The prefix is only stripped where the plugin wrote one; a title typed on
 	// a phone is taken as it is.
 	const summary = getTextProperty(doc, "SUMMARY");
-	if (summary !== undefined) {
-		patch.title = getProperty(doc, PROJECTS_PROPERTY) ? (parseProjectPrefix(summary)?.title ?? summary) : summary;
-	}
+	if (summary !== undefined) patch.title = titleFromSummary(doc, summary, context);
 
 	patch.due = readDate(doc, "DUE", context) ?? null;
 
