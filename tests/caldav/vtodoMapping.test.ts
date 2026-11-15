@@ -616,13 +616,42 @@ describe("projects", () => {
 	});
 
 	it("spots a missing prefix or outdated project names", () => {
-		expect(hasStaleProjects(encode(["House"]), ["House"])).toBe(false);
-		expect(hasStaleProjects(encode(), [])).toBe(false);
-		expect(hasStaleProjects(encode(), ["House"])).toBe(true);
-		expect(hasStaleProjects(encode(["House"]), [])).toBe(true);
-		expect(hasStaleProjects(encode(["House"]), ["House", "Garden"])).toBe(true);
+		expect(hasStaleProjects(encode(["House"]), ["House"], context)).toBe(false);
+		expect(hasStaleProjects(encode(), [], context)).toBe(false);
+		expect(hasStaleProjects(encode(), ["House"], context)).toBe(true);
+		expect(hasStaleProjects(encode(["House"]), [], context)).toBe(true);
+		expect(hasStaleProjects(encode(["House"]), ["House", "Garden"], context)).toBe(true);
 		const edited = encode(["House"]);
 		setTextProperty(edited, "SUMMARY", "Fix the roof");
-		expect(hasStaleProjects(edited, ["House"])).toBe(true);
+		expect(hasStaleProjects(edited, ["House"], context)).toBe(true);
+	});
+
+	describe("with the prefix turned off", () => {
+		const off = { ...context, projectPrefix: false };
+		const encodeOff = (projects?: string[]) => {
+			const doc = createVTodoDocument();
+			applyTaskToVTodo(doc, task, off, { uid: "u", projects });
+			return doc;
+		};
+
+		it("leaves the title alone but still lists the projects", () => {
+			const doc = encodeOff(["House"]);
+			expect(getTextProperty(doc, "SUMMARY")).toBe("Fix the roof");
+			expect(getProperty(doc, "X-TASKNOTES-PROJECTS")?.value).toBe("House");
+		});
+
+		it("strips a prefix left from before, but not a title with a pipe in it", () => {
+			expect(readVTodoIntoTaskPatch(encode(["House"]), off).title).toBe("Fix the roof");
+			const typed = encodeOff(["House"]);
+			setTextProperty(typed, "SUMMARY", "Budget | Q3");
+			expect(readVTodoIntoTaskPatch(typed, off).title).toBe("Budget | Q3");
+		});
+
+		it("spots a prefix left from before", () => {
+			expect(hasStaleProjects(encode(["House"]), ["House"], off)).toBe(true);
+			expect(hasStaleProjects(encodeOff(["House"]), ["House"], off)).toBe(false);
+			expect(hasStaleProjects(encodeOff(), [], off)).toBe(false);
+			expect(hasStaleProjects(encodeOff(), ["House"], off)).toBe(true);
+		});
 	});
 });

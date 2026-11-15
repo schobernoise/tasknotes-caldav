@@ -686,7 +686,7 @@ export class CalDavSyncService {
 			const stale =
 				held !== null &&
 				((rescaled && hasStalePriority(held, task, this.mappingContext(target))) ||
-					hasStaleProjects(held, await this.projectNames(task)) ||
+					hasStaleProjects(held, await this.projectNames(task), this.mappingContext(target)) ||
 					hasStaleRelations(held, (await this.resolveOutboundRelations(task)).relations));
 			if ((routed && routed.list.id !== target.list.id) || stale) plan.toPush.push(local);
 		}
@@ -1555,6 +1555,7 @@ export class CalDavSyncService {
 			// The list already says what its routing tags would.
 			hiddenTags: [...(this.settings.syncTaskTag ? [] : this.taskTags()), ...target.list.tags],
 			priorityMap: this.settings.priorityMap,
+			projectPrefix: this.settings.projectTitlePrefix,
 		};
 	}
 

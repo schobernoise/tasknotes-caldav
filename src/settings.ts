@@ -65,6 +65,8 @@ export interface CalDavSettings {
 	pushDebounceMs: number;
 	/** Send TaskNotes' task-identification tag as a CATEGORY. It is kept on notes either way. */
 	syncTaskTag: boolean;
+	/** Start a project task's title on the server with its first project. Notes never carry it. */
+	projectTitlePrefix: boolean;
 	/** PRIORITY (0-9) per TaskNotes priority value; missing ones take the default scale. */
 	priorityMap: Record<string, number>;
 	debugLogging: boolean;
@@ -75,6 +77,7 @@ export const DEFAULT_SETTINGS: CalDavSettings = {
 	pushOnChange: true,
 	pushDebounceMs: 1500,
 	syncTaskTag: false, // Every synced task has it, so on the server it is noise
+	projectTitlePrefix: true, // Task apps show no project otherwise
 	priorityMap: {},
 	debugLogging: false,
 };

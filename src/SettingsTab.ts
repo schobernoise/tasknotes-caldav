@@ -93,6 +93,19 @@ export class CalDavSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
+			.setName("Project in task titles")
+			.setDesc(
+				"On the server, start a project task's title with its project: “House | Fix the roof”, since task apps don't show project links. Your notes' titles never carry it."
+			)
+			.addToggle((toggle) =>
+				toggle.setValue(this.settings.projectTitlePrefix).onChange((value) => {
+					this.settings.projectTitlePrefix = value;
+					this.save();
+					this.display();
+				})
+			);
+
+		new Setting(containerEl)
 			.setName("Debug logging")
 			.setDesc("Log sync decisions to the developer console.")
 			.addToggle((toggle) =>
@@ -358,7 +371,9 @@ export class CalDavSettingTab extends PluginSettingTab {
 			const projectTasks = new Setting(body)
 				.setName("Project tasks")
 				.setDesc(
-					"Where tasks go that belong to a project, directly or as a subtask, whatever their tags. On the server their title starts with the project: “House | Fix the roof”."
+					`Where tasks go that belong to a project, directly or as a subtask, whatever their tags.${
+						this.settings.projectTitlePrefix ? " On the server their title starts with the project: “House | Fix the roof”." : ""
+					}`
 				);
 			this.listDropdown(projectTasks, account, unrouted, "Route by tags", account.projectListId, (listId) => {
 				account.projectListId = listId;
